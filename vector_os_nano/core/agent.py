@@ -68,6 +68,7 @@ class Agent:
         skills: list[Skill] | None = None,
         config: dict | str | None = None,
         auto_perception: bool = False,
+        base: Any = None,
     ) -> None:
         # ---- Configuration --------------------------------------------------
         if isinstance(config, dict):
@@ -78,6 +79,7 @@ class Agent:
         # ---- Hardware -------------------------------------------------------
         self._arm = arm
         self._gripper = gripper
+        self._base = base
 
         # Auto-create SO101Gripper when arm shares a serial bus and no gripper
         # was explicitly supplied.
@@ -118,18 +120,45 @@ class Agent:
         # ---- LLM provider ---------------------------------------------------
         # llm= takes priority over llm_api_key=
         self._llm = llm
-        if llm is None and llm_api_key:
-            try:
-                from vector_os_nano.llm.claude import ClaudeProvider  # lazy
-
-                llm_cfg = self._config.get("llm", {})
-                self._llm = ClaudeProvider(
-                    api_key=llm_api_key,
-                    model=llm_cfg.get("model", "anthropic/claude-sonnet-4-6"),
-                    api_base=llm_cfg.get("api_base", "https://openrouter.ai/api/v1"),
-                )
-            except Exception as exc:
-                logger.warning("Could not create ClaudeProvider: %s", exc)
+        if llm is None:
+            llm_cfg = self._config.get("llm", {})
+            provider = llm_cfg.get("provider", "claude")
+            
+            if provider == "local":
+                # Local Ollama - no API key needed
+                try:
+                    from vector_os_nano.llm.local import LocalProvider
+                    self._llm = LocalProvider(
+                        model=llm_cfg.get("model", "llama3:8b"),
+                        host=llm_cfg.get("api_base", "http://127.0.0.1:11434").replace("/v1", ""),
+                    )
+                    logger.info("Using LocalProvider (Ollama): %s", llm_cfg.get("model", "llama3"))
+                except Exception as exc:
+                    logger.warning("Could not create LocalProvider: %s", exc)
+            elif provider == "openai":
+                # OpenAI or OpenAI-compatible API
+                try:
+                    from vector_os_nano.llm.openai_compat import OpenAIProvider
+                    self._llm = OpenAIProvider(
+                        api_key=llm_api_key or "",
+                        model=llm_cfg.get("model", "gpt-4o-mini"),
+                        api_base=llm_cfg.get("api_base", "https://api.openai.com/v1"),
+                    )
+                    logger.info("Using OpenAIProvider: %s", llm_cfg.get("model"))
+                except Exception as exc:
+                    logger.warning("Could not create OpenAIProvider: %s", exc)
+            elif llm_api_key:
+                # Default: Claude via OpenRouter or direct API
+                try:
+                    from vector_os_nano.llm.claude import ClaudeProvider  # lazy
+                    self._llm = ClaudeProvider(
+                        api_key=llm_api_key,
+                        model=llm_cfg.get("model", "anthropic/claude-sonnet-4-6"),
+                        api_base=llm_cfg.get("api_base", "https://openrouter.ai/api/v1"),
+                    )
+                    logger.info("Using ClaudeProvider: %s", llm_cfg.get("model"))
+                except Exception as exc:
+                    logger.warning("Could not create ClaudeProvider: %s", exc)
 
         # ---- World model ----------------------------------------------------
         self._world_model = WorldModel()
@@ -168,23 +197,33 @@ class Agent:
 
     def _sync_robot_state(self) -> None:
         """Sync world model robot state from hardware."""
-        if self._arm is None:
-            return
-        try:
-            joints = self._arm.get_joint_positions()
-            ee_pos = (0.0, 0.0, 0.0)
-            if self._ik_solver is not None:
-                try:
-                    pos, _ = self._ik_solver.fk(joints)
-                    ee_pos = tuple(pos)
-                except Exception:
-                    pass
-            self._world_model.update_robot_state(
-                joint_positions=tuple(joints),
-                ee_position=ee_pos,
-            )
-        except Exception as exc:
-            logger.debug("Could not sync robot state: %s", exc)
+        if self._arm is not None:
+            try:
+                joints = self._arm.get_joint_positions()
+                ee_pos = (0.0, 0.0, 0.0)
+                if self._ik_solver is not None:
+                    try:
+                        pos, _ = self._ik_solver.fk(joints)
+                        ee_pos = tuple(pos)
+                    except Exception:
+                        pass
+                self._world_model.update_robot_state(
+                    joint_positions=tuple(joints),
+                    ee_position=ee_pos,
+                )
+            except Exception as exc:
+                logger.debug("Could not sync robot state: %s", exc)
+
+        if self._base is not None:
+            try:
+                pos = self._base.get_position()
+                heading = self._base.get_heading()
+                self._world_model.update_robot_state(
+                    position_xy=(pos[0], pos[1]),
+                    heading=heading,
+                )
+            except Exception as exc:
+                logger.debug("Could not sync base state: %s", exc)
 
     def _refresh_objects(self) -> None:
         """Populate world model with current objects from sim or perception.
@@ -653,8 +692,20 @@ class Agent:
         if not prompt:
             prompt = "You are V, AI assistant for Vector OS Nano robot arm. {mode} {arm_status} {gripper_status} {objects_info}"
 
-        mode = "MuJoCo simulation" if hasattr(self._arm, "get_object_positions") else "real hardware"
-        arm_status = "connected" if self._arm else "disconnected"
+        # Determine mode based on available hardware
+        if self._base is not None:
+            mode = "Go2 quadruped MuJoCo simulation"
+            arm_status = "N/A (quadruped robot, no arm)"
+        elif hasattr(self._arm, "get_object_positions"):
+            mode = "MuJoCo simulation"
+            arm_status = "connected"
+        elif self._arm:
+            mode = "real hardware"
+            arm_status = "connected"
+        else:
+            mode = "no hardware"
+            arm_status = "disconnected"
+
         gripper_status = "unknown"
         if self._gripper:
             try:
@@ -662,6 +713,7 @@ class Agent:
                 gripper_status = "open" if pos > 0.5 else "closed"
             except Exception:
                 pass
+
         objects_info = "unknown"
         if hasattr(self._arm, "get_object_positions"):
             objs = self._arm.get_object_positions()
@@ -924,9 +976,12 @@ class Agent:
                 logger.debug("Calibration not available: %s", exc)
 
         return SkillContext(
-            arm=self._arm,
-            gripper=self._gripper,
-            perception=self._perception,
+            arms={"default": self._arm} if self._arm else {},
+            grippers={"default": self._gripper} if self._gripper else {},
+            bases={"default": self._base} if self._base else {},
+            perception_sources=(
+                {"default": self._perception} if self._perception else {}
+            ),
             world_model=self._world_model,
             calibration=self._calibration,
             config=self._config,

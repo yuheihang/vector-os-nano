@@ -8,6 +8,9 @@ Usage::
     python run.py --dashboard  # TUI dashboard mode
     python run.py --cli        # CLI mode (explicit)
     python run.py -d           # TUI dashboard (short flag)
+    python run.py --sim-go2               # Go2 MuJoCo simulation
+    python run.py --sim-go2 --explore     # Go2 autonomous exploration (TARE + VNav)
+    python run.py --sim-go2 --explore --sim-go2-headless  # headless exploration
 
 Set OPENROUTER_API_KEY in the environment (or in config/user.yaml) before
 running if you want LLM-powered natural language control.
@@ -17,6 +20,7 @@ No ROS2 required — pure Python.
 import argparse
 import os
 import sys
+import time
 import logging
 
 # Suppress Qt font warnings from OpenCV
@@ -290,10 +294,115 @@ def _init_sim(cfg: dict, gui: bool = False) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Go2 exploration mode — external MuJoCo managed by launch_explore.sh
+# ---------------------------------------------------------------------------
+
+def _init_explore_go2(cfg: dict, gui: bool = True) -> tuple:
+    """Launch the Go2 exploration stack and connect via a ROS2 proxy.
+
+    ``launch_explore.sh`` creates its own MuJoCoGo2 instance (via
+    ``go2_vnav_bridge.py``), so we must NOT create a second one here.
+    Instead we start the script as a subprocess and proxy commands through
+    ROS2 topics using ``Go2ROS2Proxy``.
+
+    Args:
+        cfg: Config dict (currently unused, reserved for future options).
+        gui: When False, passes ``--no-gui`` to ``launch_explore.sh``.
+
+    Returns:
+        Tuple of (None, None, None, None, base) where base is a
+        connected ``Go2ROS2Proxy``.
+    """
+    import signal
+    import subprocess
+    import atexit
+
+    script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "scripts", "launch_explore.sh"
+    )
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f"launch_explore.sh not found at {script!r}")
+
+    cmd: list[str] = [script]
+    if not gui:
+        cmd.append("--no-gui")
+
+    print("Launching exploration stack (MuJoCo + VNav + TARE)...")
+    print("This takes ~30 seconds to fully initialise...")
+
+    # Route explore-stack output to a log file to keep the agent CLI clean.
+    log_path = "/tmp/vector_explore.log"
+    log_fh = open(log_path, "w")  # noqa: WPS515 — intentional long-lived file handle
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
+    )
+
+    def _cleanup() -> None:
+        log_fh.close()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+
+    atexit.register(_cleanup)
+
+    # Give the exploration stack time to bring up MuJoCo + all ROS2 nodes.
+    time.sleep(25)
+
+    from vector_os_nano.hardware.sim.go2_ros2_proxy import Go2ROS2Proxy
+
+    base = Go2ROS2Proxy()
+    base.connect()
+
+    pos = base.get_position()
+    print(f"Go2 exploration mode ready. Position: ({pos[0]:.1f}, {pos[1]:.1f})")
+    print(f"Explore-stack log: {log_path}")
+
+    return None, None, None, None, base
+
+
+# ---------------------------------------------------------------------------
+# Go2 simulation initialisation — MuJoCo quadruped, no arm hardware
+# ---------------------------------------------------------------------------
+
+def _init_sim_go2(cfg: dict, gui: bool = False) -> tuple:
+    """Initialise Go2 quadruped MuJoCo simulation.
+
+    Returns (arm, gripper, perception, calibration, base) where arm/gripper/
+    perception/calibration are all None (Go2 has no arm) and base is MuJoCoGo2.
+
+    Args:
+        cfg: Config dict (reserved for future options).
+        gui: Open the MuJoCo viewer window for visual feedback.
+
+    Returns:
+        Tuple of (None, None, None, None, base).
+    """
+    from vector_os_nano.hardware.sim.mujoco_go2 import MuJoCoGo2
+
+    print("Starting Go2 MuJoCo simulation...")
+    base = MuJoCoGo2(gui=gui)
+    base.connect()
+    base.stand()
+
+    pos = base.get_position()
+    print(f"Go2 standing at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+
+    return None, None, None, None, base
+
+
+# ---------------------------------------------------------------------------
 # Cleanup helper
 # ---------------------------------------------------------------------------
 
-def _shutdown(arm, perception) -> None:
+def _shutdown(arm, perception, base=None) -> None:
     """Disconnect hardware gracefully."""
     print("Shutting down...")
     if perception is not None and hasattr(perception, "stop_continuous_tracking"):
@@ -313,6 +422,12 @@ def _shutdown(arm, perception) -> None:
             print("Perception disconnected.")
         except Exception as exc:
             logger.warning("Error disconnecting perception: %s", exc)
+    if base is not None:
+        try:
+            base.disconnect()
+            print("Base disconnected.")
+        except Exception as exc:
+            logger.warning("Error disconnecting base: %s", exc)
     # Force exit — MuJoCo viewer GL context can hang the process
     os._exit(0)
 
@@ -373,21 +488,22 @@ def _start_camera_viewer(perception):
                 if color is None or depth is None:
                     continue
 
-                rgb_display = color.copy()
+                # color is RGB from camera; convert to BGR for OpenCV display
+                bgr_display = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
                 if hasattr(perception, '_last_tracked') and perception._last_tracked:
                     for obj in perception._last_tracked:
                         if obj.bbox_2d:
                             x1, y1, x2, y2 = [int(v) for v in obj.bbox_2d]
-                            cv2.rectangle(rgb_display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            cv2.rectangle(bgr_display, (x1, y1), (x2, y2), (0, 255, 0), 2)
                             lbl = obj.label
                             if obj.pose:
                                 lbl += f" ({obj.pose.x:.2f},{obj.pose.y:.2f},{obj.pose.z:.2f})"
-                            rgb_display = _put_text_pil(rgb_display, lbl, (x1, max(y1 - 20, 0)))
+                            bgr_display = _put_text_pil(bgr_display, lbl, (x1, max(y1 - 20, 0)))
                 elif hasattr(perception, '_last_detections') and perception._last_detections:
                     for det in perception._last_detections:
                         x1, y1, x2, y2 = [int(v) for v in det.bbox]
-                        cv2.rectangle(rgb_display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        rgb_display = _put_text_pil(rgb_display, det.label, (x1, max(y1 - 20, 0)))
+                        cv2.rectangle(bgr_display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        bgr_display = _put_text_pil(bgr_display, det.label, (x1, max(y1 - 20, 0)))
 
                 depth_f = np.clip(depth.astype(np.float32), 0, 500)
                 depth_u8 = (depth_f / 500.0 * 255).astype(np.uint8)
@@ -409,7 +525,7 @@ def _start_camera_viewer(perception):
                             cv2.putText(depth_colored, info, (cx + 10, cy),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-                combined = np.hstack([rgb_display, depth_colored])
+                combined = np.hstack([bgr_display, depth_colored])
                 cv2.imshow("Vector OS", combined)
                 if cv2.waitKey(33) == 27:
                     break
@@ -440,7 +556,7 @@ def _run_agent_mode(agent, cfg, api_key, args) -> None:
 
     from vector_os_nano.core.tool_agent import ToolAgent
 
-    model = args.agent_model or cfg.get("llm", {}).get("models", {}).get("agent", "openai/gpt-4o-mini")
+    model = args.agent_model or cfg.get("llm", {}).get("models", {}).get("agent", "openai/gpt-4o")
     api_base = cfg.get("llm", {}).get("api_base", "https://openrouter.ai/api/v1")
 
     tool_agent = ToolAgent(
@@ -497,22 +613,27 @@ def _run_agent_mode(agent, cfg, api_key, args) -> None:
             if args.verbose:
                 console.print(f"  [dim cyan][{stage}][/] [dim]{detail}[/]")
 
-        response = tool_agent.chat(
-            user_input,
-            on_tool_call=_on_tool_call,
-            on_debug=_on_debug,
-        )
+        try:
+            response = tool_agent.chat(
+                user_input,
+                on_tool_call=_on_tool_call,
+                on_debug=_on_debug,
+            )
+        except Exception as exc:
+            response = f"Error: {exc}"
+            console.print(f"  [red]Agent error: {exc}[/]")
 
-        console.print()
-        console.print(Panel(
-            response,
-            title="[bold]V[/]",
-            title_align="left",
-            border_style=_teal,
-            padding=(0, 1),
-            width=min(console.width, 70),
-        ))
-        console.print()
+        if response:
+            console.print()
+            console.print(Panel(
+                response,
+                title="[bold]V[/]",
+                title_align="left",
+                border_style=_teal,
+                padding=(0, 1),
+                width=min(console.width, 70),
+            ))
+            console.print()
 
     # Cleanup camera viewer
     if stop_camera is not None:
@@ -613,6 +734,8 @@ def main() -> None:
             "  python run.py --sim-headless     # MuJoCo sim without viewer\n"
             "  python run.py --web --sim        # Web dashboard + sim\n"
             "  python run.py --sim -d           # Sim + TUI dashboard\n"
+            "  python run.py --sim-go2 --explore            # Go2 autonomous exploration (GUI)\n"
+            "  python run.py --sim-go2-headless --explore   # Go2 autonomous exploration (headless)\n"
         ),
     )
     mode_group = parser.add_mutually_exclusive_group()
@@ -642,6 +765,24 @@ def main() -> None:
         help="MuJoCo simulation without viewer (headless)",
     )
     parser.add_argument(
+        "--sim-go2",
+        action="store_true",
+        help="Go2 quadruped MuJoCo simulation with viewer",
+    )
+    parser.add_argument(
+        "--sim-go2-headless",
+        action="store_true",
+        help="Go2 quadruped MuJoCo simulation without viewer (headless)",
+    )
+    parser.add_argument(
+        "--explore",
+        action="store_true",
+        help=(
+            "Launch autonomous exploration with Vector Nav Stack + TARE planner. "
+            "Must be combined with --sim-go2 or --sim-go2-headless."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Show agent thinking process (match, classify, route decisions)",
@@ -660,14 +801,31 @@ def main() -> None:
     args = parser.parse_args()
 
     dashboard_mode: bool = args.dashboard
-    sim_mode: bool = args.sim or args.sim_headless
+    sim_mode: bool = args.sim or args.sim_headless or args.sim_go2 or args.sim_go2_headless
+    go2_mode: bool = args.sim_go2 or args.sim_go2_headless
+
+    # Validate flag combinations early.
+    if args.explore and not go2_mode:
+        print("ERROR: --explore requires --sim-go2 or --sim-go2-headless")
+        sys.exit(1)
 
     from vector_os_nano.core.agent import Agent
     from vector_os_nano.core.config import load_config
 
     cfg = load_config("config/user.yaml")
 
-    if sim_mode:
+    base = None
+    if go2_mode:
+        if args.explore:
+            # Exploration mode: nav stack is managed externally; proxy via ROS2.
+            arm, gripper, perception, calibration, base = _init_explore_go2(
+                cfg, gui=not args.sim_go2_headless
+            )
+        else:
+            arm, gripper, perception, calibration, base = _init_sim_go2(
+                cfg, gui=not args.sim_go2_headless
+            )
+    elif sim_mode:
         arm, gripper, perception, calibration = _init_sim(cfg, gui=not args.sim_headless)
     else:
         arm, gripper, perception, calibration = _init_hardware(cfg)
@@ -679,15 +837,33 @@ def main() -> None:
         perception=perception,
         llm_api_key=api_key,
         config=cfg,
+        base=base,
     )
 
     # Inject calibration loaded from YAML (bypasses Calibration.load() .npy path)
     if calibration is not None:
         agent._calibration = calibration
 
+    # Register Go2 skills when in Go2 mode
+    if go2_mode:
+        from vector_os_nano.skills.go2 import get_go2_skills
+        for skill in get_go2_skills():
+            agent._skill_registry.register(skill)
+
     # Status summary
     print()
-    if sim_mode:
+    if go2_mode:
+        if args.explore:
+            print(
+                f"Mode      : Go2 Autonomous Exploration "
+                f"{'(headless)' if args.sim_go2_headless else '(GUI)'}"
+            )
+        else:
+            print(
+                f"Mode      : Go2 MuJoCo simulation "
+                f"{'(headless)' if args.sim_go2_headless else '(GUI)'}"
+            )
+    elif sim_mode:
         print(f"Mode      : MuJoCo simulation {'(headless)' if args.sim_headless else '(GUI)'}")
     print(f"Skills    : {', '.join(agent.skills)}")
     llm_label = (
@@ -704,12 +880,13 @@ def main() -> None:
             _run_web(agent, cfg)
         elif dashboard_mode:
             _run_dashboard(agent)
-        elif args.agent:
+        elif args.agent or go2_mode:
+            # Go2 mode always uses ToolAgent (CLI prompts assume robot arm)
             _run_agent_mode(agent, cfg, api_key, args)
         else:
             _run_cli(agent, perception, verbose=args.verbose)
     finally:
-        _shutdown(arm, perception)
+        _shutdown(arm, perception, base=base)
 
 
 def main_dashboard() -> None:
