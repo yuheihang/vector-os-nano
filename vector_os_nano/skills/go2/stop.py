@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 Vector Robotics
+
 """StopSkill -- emergency stop, immediately halts all movement.
 
 Calls set_velocity(0, 0, 0) on the base and publishes a zero-velocity
@@ -46,6 +49,23 @@ class StopSkill:
                 error_message="No base connected",
                 diagnosis_code="no_base",
             )
+
+        # Signal global abort — stops VGG, GoalExecutor, navigate, explore
+        try:
+            from vector_os_nano.vcli.cognitive.abort import request_abort
+            request_abort()
+            logger.info("[STOP] Global abort signal sent")
+        except Exception:
+            pass
+
+        # Cancel any background exploration
+        try:
+            from vector_os_nano.skills.go2.explore import cancel_exploration, is_exploring
+            if is_exploring():
+                cancel_exploration()
+                logger.info("[STOP] Background exploration cancelled")
+        except Exception:
+            pass
 
         # Hard stop via base interface
         try:

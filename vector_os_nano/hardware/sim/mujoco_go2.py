@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 Vector Robotics
+
 """MuJoCo-based simulated Unitree Go2 quadruped.
 
 Lifecycle: MuJoCoGo2(gui=False) -> connect() -> stand/sit/lie_down -> disconnect().
@@ -55,6 +58,7 @@ def _get_mujoco() -> Any:
 
 _MJCF_DIR: Path = Path(__file__).parent / "mjcf" / "go2"
 _ROOM_XML: Path = Path(__file__).parent / "go2_room.xml"
+_GO2_PIPER_XML: Path = Path(__file__).parent / "mjcf" / "go2_piper" / "go2_piper.xml"
 
 # ---------------------------------------------------------------------------
 # Constants — postures
@@ -63,6 +67,16 @@ _ROOM_XML: Path = Path(__file__).parent / "go2_room.xml"
 _STAND_JOINTS: list[float] = [0.0, 0.9, -1.8] * 4
 _SIT_JOINTS: list[float] = [0.0, 1.5, -2.5] * 4
 _LIE_DOWN_JOINTS: list[float] = [0.0, 2.0, -2.7] * 4
+
+# Piper stow pose — URDF zero configuration (all joints at 0).
+# joint2 range=(0, 3.14) and joint3 range=(-2.697, 0) both sit at a limit,
+# which is intentional: the URDF was designed so all-zeros is the canonical
+# "initial" / "calibration" pose. Position actuators (kp=80, kv=5) with
+# gravcomp=1 hold it to <0.3 deg drift per 2s — verified headless.
+# Ordering: joint1..joint6 then finger joint7 (joint8 coupled via equality).
+# Only applied when the loaded model has the Piper arm (nq >= 27).
+_PIPER_STOW_QPOS: list[float] = [0.0] * 8
+_PIPER_STOW_CTRL: list[float] = [0.0] * 7
 
 # ---------------------------------------------------------------------------
 # Constants — PD control
@@ -87,7 +101,7 @@ _SIM_DT: float = 1.0 / _SIM_HZ
 _CTRL_HZ: int = 200
 _CTRL_DECIM: int = _SIM_HZ // _CTRL_HZ
 
-_VIEWER_SYNC_EVERY: int = 8
+_VIEWER_SYNC_EVERY: int = 30
 
 # ---------------------------------------------------------------------------
 # Constants — sinusoidal trotting gait
@@ -142,7 +156,7 @@ class _Go2Model:
     Caches actuator IDs so set_joint_torque() is fast.
     """
 
-    __slots__ = ("model", "data", "base_bid", "_act_ids", "viewer")
+    __slots__ = ("model", "data", "base_bid", "_act_ids", "_robot_geom_ids", "viewer")
 
     def __init__(self, model: Any, data: Any) -> None:
         mj = _get_mujoco()
@@ -161,6 +175,20 @@ class _Go2Model:
                         model, mj.mjtObj.mjOBJ_ACTUATOR, f"{leg}_{joint}"
                     )
                 )
+        # Collect ALL geom IDs belonging to the robot body tree.
+        # mj_ray bodyexclude only filters ONE body. We need to filter all
+        # robot geoms (trunk + 4 legs × 3 segments = 13+ bodies) to avoid
+        # the lidar detecting Go2's own legs as obstacles.
+        self._robot_geom_ids: set[int] = set()
+        for gid in range(model.ngeom):
+            bid = model.geom_bodyid[gid]
+            # Walk up the body tree to check if this geom belongs to robot
+            check_bid = bid
+            while check_bid > 0:
+                if check_bid == self.base_bid:
+                    self._robot_geom_ids.add(gid)
+                    break
+                check_bid = model.body_parentid[check_bid]
 
     def set_joint_torque(self, torque: np.ndarray) -> None:
         """Apply 12 joint torques in canonical order."""
@@ -211,20 +239,37 @@ def _build_flat_scene_xml() -> Path:
     return out
 
 
-def _build_room_scene_xml() -> Path:
+def _build_room_scene_xml(with_arm: bool | None = None) -> Path:
     """Build composite room scene using local MJCF files.
 
-    Resolves the go2_room.xml template with paths to the local go2.xml
-    and assets directory (no convex_mpc dependency).
+    Resolves the go2_room.xml template with paths to the Go2 model (with
+    optional Piper arm mounted on the back) and assets directory.
+
+    Args:
+        with_arm: True = Go2 + Piper arm. False = bare Go2 (no
+            manipulation). Both modes run the MPC gait — _mj_update_pin
+            slices legs out of the extended qpos so PinGo2Model stays
+            happy with its fixed 12-DoF Pinocchio URDF.
+            None (default) = read VECTOR_SIM_WITH_ARM env var ("1" → True,
+            otherwise False). Lets sim_tool pass the user's choice into
+            the MuJoCo subprocess without editing launch_explore.sh.
     """
-    go2_xml = _MJCF_DIR / "go2.xml"
+    import os
+    if with_arm is None:
+        with_arm = os.environ.get("VECTOR_SIM_WITH_ARM", "0") == "1"
+    if with_arm and _GO2_PIPER_XML.exists():
+        go2_xml = _GO2_PIPER_XML
+        scene_name = "scene_room_piper.xml"
+    else:
+        go2_xml = _MJCF_DIR / "go2.xml"
+        scene_name = "scene_room.xml"
     assets_dir = _MJCF_DIR / "assets"
 
     template = _ROOM_XML.read_text()
     xml = template.replace("GO2_MODEL_PATH", str(go2_xml))
     xml = xml.replace("GO2_ASSETS_DIR", str(assets_dir))
 
-    out = _MJCF_DIR / "scene_room.xml"
+    out = _MJCF_DIR / scene_name
     out.write_text(xml)
     return out
 
@@ -313,11 +358,13 @@ class MuJoCoGo2:
     """
 
     def __init__(
-        self, gui: bool = False, room: bool = True, backend: str = "auto"
+        self, gui: bool = False, room: bool = True, backend: str = "auto",
+        viewer_track: bool = True,
     ) -> None:
         self._gui: bool = gui
         self._room: bool = room
         self._backend_pref: str = backend
+        self._viewer_track: bool = viewer_track
         self._mj: _Go2Model | None = None
         self._viewer: Any = None
         self._connected: bool = False
@@ -339,6 +386,17 @@ class MuJoCoGo2:
         self._last_scan: Any = None
         self._last_pointcloud: list = []
         self._scan_counter: int = 0
+
+        # Skill-level exclusive control gate. walk()/turn() set this
+        # to acquire control for the duration of a motion. During that
+        # window, set_velocity() rejects writes from any thread OTHER
+        # than the one holding the token — which blocks the 20 Hz bridge
+        # path-follower loop (running on the rclpy spin thread) from
+        # clobbering skill commands. The skill's own set_velocity() calls
+        # pass through because they run on the same thread that acquired
+        # the token (tid match).
+        self._skill_ctrl_until: float = 0.0
+        self._skill_ctrl_tid: int = 0
 
     # ------------------------------------------------------------------
     # Capability properties (BaseProtocol)
@@ -369,6 +427,9 @@ class MuJoCoGo2:
             model = mj.MjModel.from_xml_path(str(scene_path))
             data = mj.MjData(model)
             self._mj = _Go2Model(model, data)
+            # Expose for downstream consumers that need to load an isolated
+            # MjModel from the same MJCF (e.g. MuJoCoPiper's IK).
+            self._scene_xml_path = str(scene_path)
 
             # Place Go2 in the entry hall (center of house)
             data.qpos[0] = 10.0
@@ -376,11 +437,19 @@ class MuJoCoGo2:
             data.qpos[2] = 0.35
             # Set standing joint angles
             data.qpos[7:19] = _STAND_JOINTS
+            # If Piper arm is mounted (nq=27 vs 19), stow it folded upright;
+            # otherwise joint2 defaults to 0 and the arm extends horizontally,
+            # shifting 1.2kg of link6+ mass forward and tipping the dog.
+            if model.nq >= 27:
+                data.qpos[19:27] = _PIPER_STOW_QPOS
+            if model.nu >= 19:
+                data.ctrl[12:19] = _PIPER_STOW_CTRL
         else:
             scene_path = _build_flat_scene_xml()
             model = mj.MjModel.from_xml_path(str(scene_path))
             data = mj.MjData(model)
             self._mj = _Go2Model(model, data)
+            self._scene_xml_path = str(scene_path)
 
             # Apply home keyframe (standing pose at origin)
             key_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_KEY, "stand")
@@ -404,9 +473,9 @@ class MuJoCoGo2:
                 if self._viewer is not None:
                     self._viewer.cam.type = mj.mjtCamera.mjCAMERA_FREE
                     if self._room:
-                        self._viewer.cam.lookat[:] = [10.0, 7.0, 0.0]
-                        self._viewer.cam.distance = 22.0
-                        self._viewer.cam.elevation = -65
+                        self._viewer.cam.lookat[:] = [10.0, 3.0, 0.3]
+                        self._viewer.cam.distance = 5.5
+                        self._viewer.cam.elevation = -20
                         self._viewer.cam.azimuth = -90
                     else:
                         self._viewer.cam.lookat[:] = [0.0, 0.0, 0.3]
@@ -494,13 +563,25 @@ class MuJoCoGo2:
     # ------------------------------------------------------------------
 
     def _init_mpc_stack(self) -> None:
-        """Initialize convex_mpc control stack. Raises ImportError if unavailable."""
+        """Initialize convex_mpc control stack. Raises ImportError if unavailable.
+
+        Pinocchio is allowed to have *fewer* DoFs than MuJoCo — when an arm
+        is mounted (Go2+Piper, MuJoCo nq=27 vs PinGo2 nq=19), _mj_update_pin
+        slices the leg portion out of qpos/qvel. Only the reverse is an
+        unrecoverable mismatch.
+        """
         from convex_mpc.go2_robot_data import PinGo2Model  # noqa: PLC0415
         from convex_mpc.gait import Gait                   # noqa: PLC0415
         from convex_mpc.com_trajectory import ComTraj       # noqa: PLC0415
         from convex_mpc.leg_controller import LegController # noqa: PLC0415
 
         self._pin = PinGo2Model()
+        if self._pin.model.nq > self._mj.model.nq:
+            raise RuntimeError(
+                f"MPC backend incompatible with scene: "
+                f"Pinocchio nq={self._pin.model.nq} > MuJoCo nq={self._mj.model.nq}. "
+                f"Loaded MJCF is missing DoFs the Pinocchio model requires."
+            )
         self._gait = Gait(_MPC_GAIT_HZ, _MPC_GAIT_DUTY)
         self._traj = ComTraj(self._pin)
         self._mpc = None  # lazy — first locomotion call
@@ -559,6 +640,9 @@ class MuJoCoGo2:
                 scan_counter = 0
 
             if self._viewer is not None and sim_step % _VIEWER_SYNC_EVERY == 0:
+                if self._viewer_track:
+                    pos = self._mj.data.qpos[0:3]
+                    self._viewer.cam.lookat[:] = [float(pos[0]), float(pos[1]), 0.3]
                 self._viewer.sync()
 
             sim_step += 1
@@ -657,6 +741,9 @@ class MuJoCoGo2:
                 scan_counter = 0
 
             if self._viewer is not None and sim_step % _VIEWER_SYNC_EVERY == 0:
+                if self._viewer_track:
+                    pos = self._mj.data.qpos[0:3]
+                    self._viewer.cam.lookat[:] = [float(pos[0]), float(pos[1]), 0.3]
                 self._viewer.sync()
 
             sim_step += 1
@@ -672,6 +759,11 @@ class MuJoCoGo2:
         Converts MuJoCo (wxyz quaternion, world-frame linear vel) to
         Pinocchio (xyzw quaternion, body-frame linear vel) and runs
         the full set of Pinocchio computations the MPC solver needs.
+
+        When MuJoCo carries extra DoFs beyond the PinGo2 model (e.g. a
+        mounted Piper arm adds 8 DoFs), the leg segment is sliced out —
+        MuJoCo qpos layout is [base(7), legs(12), arm(...)], which matches
+        the Pinocchio URDF exactly for the first 19 entries.
         """
         mujoco_q = np.asarray(self._mj.data.qpos, dtype=float).reshape(-1)
         mujoco_dq = np.asarray(self._mj.data.qvel, dtype=float).reshape(-1)
@@ -683,8 +775,10 @@ class MuJoCoGo2:
         v_body = R.T @ mujoco_dq[0:3]
         w_body = mujoco_dq[3:6]
 
-        q_pin = np.concatenate([mujoco_q[0:3], [qx, qy, qz, qw], mujoco_q[7:]])
-        dq_pin = np.concatenate([v_body, w_body, mujoco_dq[6:]])
+        n_leg_q = self._pin.model.nq - 7   # legs-only qpos count (12 for Go2)
+        n_leg_v = self._pin.model.nv - 6   # legs-only qvel count (12 for Go2)
+        q_pin = np.concatenate([mujoco_q[0:3], [qx, qy, qz, qw], mujoco_q[7:7 + n_leg_q]])
+        dq_pin = np.concatenate([v_body, w_body, mujoco_dq[6:6 + n_leg_v]])
 
         self._pin.update_model(q_pin, dq_pin)
 
@@ -693,8 +787,18 @@ class MuJoCoGo2:
     # ------------------------------------------------------------------
 
     def set_velocity(self, vx: float, vy: float, vyaw: float) -> None:
-        """Set target body velocity. Non-blocking."""
+        """Set target body velocity. Non-blocking.
+
+        Skill-exclusive gate: if a skill holds the control token
+        (self._skill_ctrl_until in the future), calls from OTHER threads
+        are silently ignored — this blocks the bridge path-follower /
+        /cmd_vel_nav callback / safety-check from overriding a walk()
+        or turn() in progress. The token holder (same thread) passes.
+        """
         self._require_connection()
+        if (time.time() < self._skill_ctrl_until
+                and threading.get_ident() != self._skill_ctrl_tid):
+            return
         with self._cmd_lock:
             self._cmd_vel = (
                 float(np.clip(vx, -_VX_MAX, _VX_MAX)),
@@ -705,6 +809,33 @@ class MuJoCoGo2:
     # ------------------------------------------------------------------
     # State queries
     # ------------------------------------------------------------------
+
+    def reset_pose(self) -> None:
+        """Reset robot to standing pose at current XY position.
+
+        Fixes tip-overs without restarting the simulation. Keeps the robot
+        at its current (x, y) but resets z, orientation, joint angles, and
+        all velocities to the default standing state.
+        """
+        self._require_connection()
+        import mujoco as mj
+        data = self._mj.data
+        # Keep current XY, reset everything else
+        cur_x, cur_y = float(data.qpos[0]), float(data.qpos[1])
+        data.qpos[0] = cur_x
+        data.qpos[1] = cur_y
+        data.qpos[2] = 0.35                    # standing height
+        data.qpos[3:7] = [1, 0, 0, 0]          # upright quaternion (w,x,y,z)
+        data.qpos[7:19] = _STAND_JOINTS         # standing joint angles
+        # If Piper arm is mounted, set it to the stow pose too (nq=27 vs 19)
+        if self._mj.model.nq >= 27:
+            data.qpos[19:27] = _PIPER_STOW_QPOS
+        data.qvel[:] = 0                         # zero all velocities
+        data.ctrl[:] = 0                         # zero all actuators
+        # Likewise drive Piper position actuators to stow (nu=19 vs 12)
+        if self._mj.model.nu >= 19:
+            data.ctrl[12:19] = _PIPER_STOW_CTRL
+        mj.mj_forward(self._mj.model, data)
 
     def get_position(self) -> list[float]:
         """Return base position [x, y, z] in world frame."""
@@ -754,6 +885,83 @@ class MuJoCoGo2:
             self._update_lidar()
         return self._last_pointcloud
 
+    def get_camera_frame(
+        self, width: int = 640, height: int = 480,
+    ) -> "np.ndarray":
+        """Render first-person RGB from d435_rgb camera mounted on Go2 head.
+
+        Returns an (H, W, 3) uint8 numpy array in RGB order.
+        Uses the named 'd435_rgb' camera defined in the MJCF model, which is
+        fixed to base_link. This gives the exact same view as a real D435
+        mounted on the robot — no free-camera approximation.
+        """
+        self._require_connection()
+        mj = _get_mujoco()
+
+        if not hasattr(self, "_cam_renderer"):
+            self._cam_renderer = mj.Renderer(self._mj.model, height, width)
+            self._cam_renderer.scene.flags[mj.mjtRndFlag.mjRND_SHADOW] = True
+            self._cam_renderer.scene.flags[mj.mjtRndFlag.mjRND_REFLECTION] = True
+
+        cam_id = self._mj.model.cam("d435_rgb").id
+        self._cam_renderer.update_scene(self._mj.data, camera=cam_id)
+        return self._cam_renderer.render().copy()
+
+    def get_depth_frame(
+        self, width: int = 640, height: int = 480,
+    ) -> "np.ndarray":
+        """Render depth from d435_depth camera mounted on Go2 head.
+
+        Returns an (H, W) float32 numpy array in metres. Uses the named
+        'd435_depth' camera — same mounting as RGB for pixel alignment.
+        """
+        self._require_connection()
+        mj = _get_mujoco()
+
+        if not hasattr(self, "_depth_renderer"):
+            self._depth_renderer = mj.Renderer(self._mj.model, height, width)
+            self._depth_renderer.enable_depth_rendering()
+            self._depth_renderer.scene.flags[mj.mjtRndFlag.mjRND_SHADOW] = True
+
+        cam_id = self._mj.model.cam("d435_depth").id
+        self._depth_renderer.update_scene(self._mj.data, camera=cam_id)
+        raw = self._depth_renderer.render().copy()
+
+        import numpy as np
+        depth = raw.astype(np.float32)
+        depth[(depth < 0.1) | (depth > 10.0)] = 0.0
+        return depth
+
+    def get_camera_pose(self) -> tuple:
+        """Return (cam_xpos, cam_xmat) for the d435_rgb camera.
+
+        cam_xpos: (3,) world position
+        cam_xmat: (9,) rotation matrix (row-major, reshape to 3x3)
+
+        Used by depth_projection.camera_to_world for exact transforms.
+        """
+        self._require_connection()
+        cam_id = self._mj.model.cam("d435_rgb").id
+        return (
+            self._mj.data.cam_xpos[cam_id].copy(),
+            self._mj.data.cam_xmat[cam_id].copy(),
+        )
+
+    def get_rgbd_frame(
+        self, width: int = 640, height: int = 480,
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """Render aligned RGB + depth from the same camera pose.
+
+        Returns (rgb, depth) where:
+            rgb: (H, W, 3) uint8 array
+            depth: (H, W) float32 array in metres
+
+        Simulates RealSense D435 aligned_depth_to_color output.
+        """
+        rgb = self.get_camera_frame(width, height)
+        depth = self.get_depth_frame(width, height)
+        return rgb, depth
+
     # ------------------------------------------------------------------
     # Sensor update helpers
     # ------------------------------------------------------------------
@@ -787,10 +995,13 @@ class MuJoCoGo2:
         from vector_os_nano.core.types import LaserScan  # noqa: PLC0415
         mj = _get_mujoco()
 
-        # Sensor mounting: 0.2m forward, 0.1m up from base center
-        # (matches unitree_go2.yaml sensorOffset and bridge TF)
-        _LIDAR_OFFSET_X = 0.2
-        _LIDAR_OFFSET_Z = 0.1
+        # Sensor mounting: on top of Go2 head — above all leg geoms.
+        # 0.3m forward (head position) + 0.2m up (above trunk top).
+        # At -20° tilt, nearest ground hit ≈ 0.9m ahead of lidar →
+        # well past front legs (~0.1m ahead of lidar). No self-hits.
+        # Must match bridge _SENSOR_X/_SENSOR_Z and nav stack sensorOffset.
+        _LIDAR_OFFSET_X = 0.3
+        _LIDAR_OFFSET_Z = 0.2
 
         pos = self._mj.data.qpos[0:3].copy().astype(np.float64)
         heading = self.get_heading()
@@ -806,17 +1017,17 @@ class MuJoCoGo2:
 
         robot_body_id = self._mj.base_bid
 
-        # Scan beam tilt: 30° downward from sensor horizontal plane
+        # Scan beam tilt: 20° downward from sensor horizontal plane
         # (sensor frame itself is NOT tilted — only the beams are)
-        tilt_rad = math.radians(-30.0)
+        tilt_rad = math.radians(-20.0)
         cos_tilt = math.cos(tilt_rad)
         sin_tilt = math.sin(tilt_rad)
 
         # Livox MID360 FOV: -7° to +52° (asymmetric, 59° range)
-        # With 30° downward tilt → world frame: -37° to +22°
+        # With 20° downward tilt → world frame: -27° to +32°
         # This gives both ground hits (below horizontal) and wall hits (above)
         n_azimuth = 360
-        elevations = list(range(-7, 53, 2))  # -7° to +52° in 2° steps = 30 rings
+        elevations = list(range(-8, 53, 2))  # -8° to +52° in 2° steps, includes 0° for 2D scan
         mid_ring_ranges: list[float] = []
         points_3d: list[tuple[float, float, float, float]] = []
 
@@ -860,16 +1071,22 @@ class MuJoCoGo2:
                     robot_body_id,
                     geom_id,
                 )
-                if dist > 0 and dist < 12.0:
+                # Skip self-hits: mj_ray bodyexclude only filters the trunk
+                # body. Leg geoms (hip/thigh/calf) are separate bodies and
+                # can be hit by rays pointing downward/forward. Filter them
+                # using the pre-built robot geom set.
+                if dist > 0 and dist < 12.0 and int(geom_id[0]) not in self._mj._robot_geom_ids:
                     px = pos_lidar[0] + dist * direction[0]
                     py = pos_lidar[1] + dist * direction[1]
                     pz = pos_lidar[2] + dist * direction[2]
                     points_3d.append((float(px), float(py), float(pz), 0.0))
 
                 if elev_deg == 0:
-                    mid_ring_ranges.append(
-                        float(dist) if dist > 0 else float("inf")
-                    )
+                    # Self-hit → treat as no hit (inf range) for LaserScan too
+                    if dist > 0 and int(geom_id[0]) not in self._mj._robot_geom_ids:
+                        mid_ring_ranges.append(float(dist))
+                    else:
+                        mid_ring_ranges.append(float("inf"))
 
         self._last_scan = LaserScan(
             timestamp=float(self._mj.data.time),
@@ -979,13 +1196,22 @@ class MuJoCoGo2:
 
         The robot should be standing before calling (call stand() first).
 
+        Acquires skill-level control authority for `duration + 0.3s` so a
+        concurrently running bridge path-follower yields. Released on exit.
+
         Returns:
             True if completed without falling over.
         """
         self._require_connection()
-        self.set_velocity(vx, vy, vyaw)
-        time.sleep(duration)
-        self.set_velocity(0.0, 0.0, 0.0)
-        time.sleep(0.2)  # settle
-        pos = self.get_position()
-        return bool(pos[2] > 0.15)
+        self._skill_ctrl_tid = threading.get_ident()
+        self._skill_ctrl_until = time.time() + duration + 0.3
+        try:
+            self.set_velocity(vx, vy, vyaw)
+            time.sleep(duration)
+            self.set_velocity(0.0, 0.0, 0.0)
+            time.sleep(0.2)  # settle
+            pos = self.get_position()
+            return bool(pos[2] > 0.15)
+        finally:
+            self._skill_ctrl_until = 0.0
+            self._skill_ctrl_tid = 0

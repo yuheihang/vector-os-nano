@@ -4,6 +4,10 @@
       "command": "/home/fishyu/anaconda3/envs/vector_os_nano/bin/python",
       "args": ["-m", "vector_os_nano.mcp", "--sim", "--stdio"], 
       "cwd": "/media/fishyu/fish-14tb-2/YuXi/vector-os-nano"
+    },
+    "vector-graph": {
+      "command": "vector-graph-mcp",
+      "args": ["/media/fishyu/fish-14tb-2/YuXi/vector-os-nano"]
     }
   }
 }

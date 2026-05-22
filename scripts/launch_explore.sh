@@ -22,6 +22,10 @@ for arg in "$@"; do
     case $arg in --no-gui) NO_GUI="--no-gui" ;; esac
 done
 
+# Local VLM (Ollama) — set if not already in environment
+export VECTOR_VLM_URL="${VECTOR_VLM_URL:-http://localhost:11434/v1}"
+export VECTOR_VLM_MODEL="${VECTOR_VLM_MODEL:-gemma4:e4b}"
+
 VENV_SP="$REPO_DIR/.venv-nano/lib/python3.12/site-packages"
 CMEEL_SP="$VENV_SP/cmeel.prefix/lib/python3.12/site-packages"
 CONVEX_SRC="/home/yusen/Desktop/go2-convex-mpc/src"
@@ -45,13 +49,16 @@ cleanup() {
                 tare_planner_node go2_vnav_bridge; do
         pkill -9 -f "$proc" 2>/dev/null || true
     done
-    rm -f /dev/shm/fastrtps_* 2>/dev/null
+    rm -f /dev/shm/fastrtps_* /tmp/vector_nav_active 2>/dev/null
     wait 2>/dev/null
     echo "Done."
 }
 trap cleanup EXIT INT TERM
 
 RVIZ_CFG="$REPO_DIR/config/vnav.rviz"
+
+# Clean stale nav flag from previous session (prevents unwanted movement on startup)
+rm -f /tmp/vector_nav_active 2>/dev/null
 
 echo "============================================"
 echo "  Go2 + TARE Autonomous Exploration"
@@ -87,9 +94,20 @@ sleep 1
 
 # 4. Terrain analysis
 echo "[4/8] Starting terrain analysis..."
-ros2 run terrain_analysis terrainAnalysis &
+ros2 run terrain_analysis terrainAnalysis --ros-args \
+  -p clearDyObs:=true \
+  -p minDyObsDis:=0.14 \
+  -p minOutOfFovPointNum:=20 \
+  -p obstacleHeightThre:=0.15 \
+  -p maxRelZ:=1.5 \
+  -p limitGroundLift:=true \
+  -p maxGroundLift:=0.05 \
+  -p minDyObsVFOV:=-30.0 \
+  -p maxDyObsVFOV:=35.0 &
 PIDS+=($!)
-ros2 run terrain_analysis_ext terrainAnalysisExt &
+ros2 run terrain_analysis_ext terrainAnalysisExt --ros-args \
+  -p obstacleHeightThre:=0.15 \
+  -p maxRelZ:=1.5 &
 PIDS+=($!)
 sleep 3
 
@@ -100,6 +118,9 @@ PIDS+=($!)
 sleep 3
 
 # 6. TARE Planner (autonomous exploration — includes navigationBoundary)
+# Deploy Go2-tuned config BEFORE launch (kAutoStart=false, tuned margins)
+cp "$REPO_DIR/config/tare_go2_indoor.yaml" \
+   "$NAV_STACK/install/tare_planner/share/tare_planner/indoor_small.yaml" 2>/dev/null
 echo "[6/7] Starting TARE exploration planner..."
 ros2 launch tare_planner explore.launch scenario:=indoor_small &
 PIDS+=($!)
@@ -112,22 +133,17 @@ PIDS+=($!)
 rviz2 -d "$RVIZ_CFG" 2>/dev/null &
 PIDS+=($!)
 
-# Seed with initial movement so FAR + TARE can build initial graphs
-echo ""
-echo "Seeding planners with initial movement..."
-sleep 2
-for i in $(seq 1 4); do
-    ros2 topic pub --once /cmd_vel_nav geometry_msgs/msg/Twist "{linear: {x: 0.2}}" 2>/dev/null
-    sleep 1
-done
-ros2 topic pub --once /cmd_vel_nav geometry_msgs/msg/Twist "{}" 2>/dev/null
-sleep 2
+# No seed movement, no nav flag. Dog stays still until user gives a command.
+# TARE has kAutoStart=false — waits for /start_exploration from ExploreSkill.
+# Nav flag created by ExploreSkill or NavigateSkill when needed.
 
 echo ""
-echo "Ready! TARE is exploring autonomously."
-echo "  Watch RViz for frontier markers and planned paths."
-echo "  Teleop override: use RViz teleop panel (clears autonomous path)"
-echo "  Stop exploration: Ctrl+C"
+echo "Ready! Dog is standing still."
+echo "  Use vector-cli to control:"
+echo "    explore     — start autonomous exploration"
+echo "    go to X     — navigate to a room"
+echo "    stop        — halt all movement"
+echo "  Ctrl+C to shut down."
 echo ""
 
 wait ${PIDS[0]}

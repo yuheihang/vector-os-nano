@@ -15,7 +15,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -30,24 +30,16 @@ dependencies = [
     "pyserial>=3.5",
     "httpx>=0.25",
     "pyyaml>=6.0",
+    "anthropic>=0.40",
+    "openai>=1.0",
 ]
 
 [project.optional-dependencies]
 # Perception: Camera + VLM support
-# CRITICAL: Use PyTorch nightly (cu128) for RTX 5080 Blackwell support
-# transformers==4.57.6 is pinned because:
-#   - 4.44 lacks EdgeTAM model support
-#   - 5.x+ has tied_weights bug with Moondream (breaks VLM)
-# timm required by EdgeTAM (open-vocabulary detection)
 perception = [
     "pyrealsense2>=2.50",
-    "torch>=2.0",
-    "torchvision>=0.15",
-    "transformers==4.57.6",
-    "timm>=1.0.25",
     "open3d>=0.17",
     "opencv-python>=4.8",
-    "safetensors>=0.7.0",
 ]
 
 gpu = [
@@ -60,16 +52,6 @@ ik = [
     "pin>=3.9.0",
 ]
 
-# TUI: Dashboard terminal interface
-tui = [
-    "textual>=0.40",
-]
-
-# Web: Localhost web dashboard with AI chat
-web = [
-    "fastapi>=0.100",
-    "uvicorn[standard]>=0.20",
-]
 
 # Simulation: MuJoCo (recommended) + PyBullet (legacy)
 sim = [
@@ -92,7 +74,7 @@ mcp = [
 go2 = ["casadi>=3.6", "pin>=3.0"]
 
 all = [
-    "vector-os-nano[perception,ik,tui,sim,web,mcp]",
+    "vector-os-nano[perception,ik,sim,mcp]",
 ]
 
 # Development tools
@@ -103,9 +85,8 @@ dev = [
 ]
 
 [project.scripts]
-vector-os = "run:main"
-vector-os-dashboard = "run:main_dashboard"
 vector-os-mcp = "vector_os_nano.mcp.server:main_sync"
+vector-cli = "vector_os_nano.vcli.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vector_os_nano"]
@@ -122,4 +103,5 @@ markers = [
     "level2: Level 2 — Open-loop locomotion / walking",
     "level3: Level 3 — Velocity tracking via set_velocity()",
     "level4: Level 4 — Navigation to waypoint (P-controller placeholder)",
+    "ros2: requires rclpy installed and a live DDS context",
 ]

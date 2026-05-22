@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024-2026 Vector Robotics
+
 """Unit tests for ExploreSkill, WhereAmISkill, and StopSkill."""
 from __future__ import annotations
 
@@ -191,10 +194,10 @@ class TestExploreSkillMetadata:
     def test_not_direct(self):
         assert ExploreSkill.__skill_direct__ is False
 
-    def test_duration_parameter(self):
+    def test_no_duration_parameter(self):
+        """Non-blocking explore has no duration — runs until stopped."""
         params = ExploreSkill().parameters
-        assert "duration" in params
-        assert params["duration"]["default"] == 60.0
+        assert params == {}
 
 
 class TestExploreSkillNoBase:
@@ -206,94 +209,58 @@ class TestExploreSkillNoBase:
         assert result.diagnosis_code == "no_base"
 
 
-class TestExploreDeadReckoning:
-    """Explore via dead-reckoning (ROS2 unavailable path)."""
+class TestExploreNonBlocking:
+    """Non-blocking explore — starts background thread, returns immediately."""
 
-    def _run_with_short_duration(self, base) -> SkillResult:
+    def test_returns_started_status(self):
+        """explore() returns immediately with status=exploration_started."""
+        base = _make_base(x=10.0, y=5.0)
         ctx = _make_context(base)
         with patch(
             "vector_os_nano.skills.go2.explore._start_bridge_on_go2",
             return_value=False,
         ):
-            return ExploreSkill().execute({"duration": 5.0}, ctx)
-
-    def test_success(self):
-        base = _make_base(x=3.0, y=2.5)
-        result = self._run_with_short_duration(base)
+            result = ExploreSkill().execute({}, ctx)
         assert result.success
+        # Clean up background thread
+        from vector_os_nano.skills.go2.explore import cancel_exploration
+        cancel_exploration()
 
-    def test_result_data_has_rooms_visited(self):
-        base = _make_base(x=3.0, y=2.5)
-        result = self._run_with_short_duration(base)
-        assert "rooms_visited" in result.result_data
-        assert isinstance(result.result_data["rooms_visited"], list)
+    def test_already_exploring_returns_status(self):
+        """Second call while exploring reports current status."""
+        from vector_os_nano.skills.go2.explore import (
+            _explore_running, cancel_exploration,
+        )
+        import vector_os_nano.skills.go2.explore as _mod
+        _mod._explore_running = True
+        _mod._explore_visited = {"hallway"}
+        try:
+            base = _make_base(x=10.0, y=5.0)
+            ctx = _make_context(base)
+            result = ExploreSkill().execute({}, ctx)
+            assert result.success
+            assert result.result_data["status"] == "already_exploring"
+            assert "hallway" in result.result_data["rooms_visited"]
+        finally:
+            _mod._explore_running = False
+            _mod._explore_visited.clear()
 
-    def test_result_data_has_coverage(self):
-        base = _make_base(x=3.0, y=2.5)
-        result = self._run_with_short_duration(base)
-        assert "coverage_percent" in result.result_data
-        assert 0.0 <= result.result_data["coverage_percent"] <= 100.0
+    def test_cancel_exploration(self):
+        """cancel_exploration sets the cancel event."""
+        from vector_os_nano.skills.go2.explore import (
+            cancel_exploration, _explore_cancel,
+        )
+        import vector_os_nano.skills.go2.explore as _mod
+        _mod._explore_running = True
+        cancel_exploration()
+        assert _explore_cancel.is_set()
+        _mod._explore_running = False
+        _explore_cancel.clear()
 
-    def test_result_data_mode(self):
-        base = _make_base(x=3.0, y=2.5)
-        result = self._run_with_short_duration(base)
-        assert result.result_data["mode"] == "dead_reckoning"
-
-    def test_starting_room_is_visited(self):
-        """Robot starts in living_room -- that room must appear in rooms_visited."""
-        base = _make_base(x=3.0, y=2.5)  # living_room center
-        result = self._run_with_short_duration(base)
-        assert "living_room" in result.result_data["rooms_visited"]
-
-    def test_minimum_duration_clamped(self):
-        """Duration < 5 s is clamped to 5 s (no assertion on timing, just no crash)."""
-        base = _make_base()
-        ctx = _make_context(base)
-        with patch(
-            "vector_os_nano.skills.go2.explore._start_bridge_on_go2",
-            return_value=False,
-        ):
-            result = ExploreSkill().execute({"duration": 0.1}, ctx)
-        assert result.success
-
-    def test_robot_fall_stops_exploration(self):
-        """If _navigate_to_waypoint returns False, exploration aborts without raising."""
-        base = _make_base(x=10.0, y=5.0)  # hallway
-        ctx = _make_context(base)
-        with patch(
-            "vector_os_nano.skills.go2.explore._start_bridge_on_go2",
-            return_value=False,
-        ), patch(
-            "vector_os_nano.skills.go2.explore._navigate_to_waypoint",
-            return_value=False,
-        ):
-            result = ExploreSkill().execute({"duration": 5.0}, ctx)
-        # success=True even if cut short (partial exploration is still a result)
-        assert result.success
-
-
-class TestExploreMonitor:
-    """Test _monitor_exploration directly (no ROS2 needed)."""
-
-    def test_monitoring_tracks_rooms(self):
-        """_monitor_exploration samples position and detects rooms."""
-        base = _make_base(x=3.0, y=2.5)  # living_room
-        skill = ExploreSkill()
-
-        # Patch time: first call sets deadline (1000+5=1005), then loop runs a few times
-        with patch("vector_os_nano.skills.go2.explore.time") as mock_time:
-            call_count = [0]
-            def fake_time():
-                call_count[0] += 1
-                # First call (deadline calc): 1000. Next calls: 1001, 1002, ... then 1010 to exit
-                if call_count[0] <= 3:
-                    return 1000.0
-                return 1010.0
-            mock_time.time = fake_time
-            mock_time.sleep = lambda _: None
-            result = skill._monitor_exploration(base, 5.0)
-
-        assert result.success
-        assert result.result_data["mode"] == "tare"
-        assert "living_room" in result.result_data["rooms_visited"]
-        assert base.get_position.call_count >= 1
+    def test_get_explored_rooms(self):
+        """get_explored_rooms returns sorted room list."""
+        from vector_os_nano.skills.go2.explore import get_explored_rooms
+        import vector_os_nano.skills.go2.explore as _mod
+        _mod._explore_visited = {"kitchen", "hallway"}
+        assert get_explored_rooms() == ["hallway", "kitchen"]
+        _mod._explore_visited.clear()
