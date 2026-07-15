@@ -43,10 +43,12 @@ AI Agent (VectorEngine)
 │                  │           导航状态、探索进度                     │
 │                  │                                              │
 │                  ├── CategorizedToolRegistry                     │
-│                  │     ├── code:   文件读写编辑、bash、搜索         │
-│                  │     ├── robot:  22个技能 + 场景图查询            │
-│                  │     ├── diag:   ROS2话题/节点/日志、导航/地形    │
-│                  │     └── system: 状态、仿真、热加载              │
+│                  │     ├── code:    文件读写编辑、bash、搜索        │
+│                  │     ├── general: web_fetch                     │
+│                  │     ├── robot:   场景图/世界查询 (+臂控技能)     │
+│                  │     ├── diag:    ROS2话题/节点/日志、导航/地形   │
+│                  │     ├── sim:     start/stop_simulation         │
+│                  │     └── system:  状态、热加载、foxglove         │
 │                  │                                              │
 │                  ├── ToolHookRegistry                            │
 │                  │     ├── pre_hook: 执行前回调                   │
@@ -111,9 +113,11 @@ class CategorizedToolRegistry(ToolRegistry):
 | 类别 | 工具 | 用途 |
 |------|------|------|
 | `code` | file_read, file_write, file_edit, bash, glob, grep | 代码读写编辑 |
-| `robot` | 22个包装技能 + scene_graph_query + world_query | 机器人控制 + 空间查询 |
+| `general` | web_fetch | 网页抓取 |
+| `robot` | world_query, scene_graph_query（+ 臂控时 10 个技能工具） | 空间查询 + 机械臂控制 |
 | `diag` | ros2_topics, ros2_nodes, ros2_log, nav_state, terrain_status | ROS2 诊断 |
-| `system` | robot_status, start_simulation, web_fetch, skill_reload | 系统管理 |
+| `sim` | start_simulation, stop_simulation | 仿真管理 |
+| `system` | robot_status, skill_reload, open_foxglove | 系统状态与热加载 |
 
 ### 扩展策略
 
@@ -157,8 +161,8 @@ class IntentRouter:
 
 Token 节省效果：
 
-| 场景 | 改前 (39 工具) | 改后 (路由) | 节省 |
-|------|---------------|------------|------|
+| 场景 | 改前 (19 内置工具全发) | 改后 (路由) | 节省 |
+|------|----------------------|------------|------|
 | "我在哪" | ~2500 tokens | ~800 tokens | 68% |
 | "改速度" | ~2500 tokens | ~700 tokens | 72% |
 | "你好" | ~2500 tokens | ~2500 tokens | 0% |
@@ -215,6 +219,63 @@ Robot skill（`@skill` 装饰器）自动包装为 LLM tool：
 | navigation_failed | 导航失败，用 nav_state 检查导航栈状态 |
 | no_vlm | VLM 不可用，检查 Ollama 是否运行 |
 | camera_failed | 摄像头未连接，用 robot_status 检查硬件 |
+
+## 复杂 NL 任务的分解路径 — cognitive/ VGG 层
+
+单工具调用（"pick the cup"）由 VectorEngine 的 agent 循环直接处理。**多步复杂任务**的自然语言分解由 `vcli/cognitive/` 负责：
+
+```
+vcli/cognitive/
+├── vgg_harness.py        # VGG 主循环入口
+├── goal_decomposer.py    # 将 NL 目标拆解为子步骤计划
+├── goal_executor.py      # 逐步执行计划，调用 VectorEngine
+├── goal_verifier.py      # 验证每步结果是否达标
+├── strategy_selector.py  # 根据硬件/世界状态选择执行策略
+├── capabilities/         # 能力映射（什么机器人能做什么）
+└── worlds/               # 世界模型适配（sim / real / ros2）
+```
+
+该层实现 **decompose → plan → execute → verify** 循环，是"自然语言控制一切"北极星目标的核心执行路径。详见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)。
+
+## 非交互验收契约 — `-p / --json / VECTOR_VERDICT` (R2a acceptance instrument)
+
+`cli.main` 既是 REPL，也是**机器可验收的验收面**。这是本项目 #1 历史失败（能力靠 `~/sandbox` 脚本"验证"、绕过产品；347 个测试只有 2 个碰 `cli.main`）的根治：引擎本就计算的诚实判定
+`evidence_passed(trace, verify_oracle_names(agent, engine))` 现在能作为机器信号逃出 `cli.main`。
+
+```
+python -m vector_os_nano.vcli.cli -p "<prompt>" --json
+```
+
+- **`-p / --print TEXT`** — 跑 **一个** turn（不进 REPL）后退出。
+- **`--json`** — 在 stdout 打印**恰好一行** `VECTOR_VERDICT {<json>}`（固定 sentinel）；所有 Rich/banner 改走 **stderr**。
+- 该 turn 经 `engine.vgg_execute` **同步**执行（绝不 `vgg_execute_async` — 异步会在未完成的 trace 上抢先出判定）。
+- 判定由 frozen `VerdictReport`（`vcli/verdict.py`）承载，**只**从既有 `classify_step_evidence` / `evidence_passed` 构建，**绝不**二次推导（契约：`VerdictReport.from_trace(trace, oracle).verified == evidence_passed(trace, oracle)`）。
+
+`VECTOR_VERDICT` JSON 字段：
+
+| 字段 | 含义 |
+|------|------|
+| `verified` | bool — `evidence_passed` 的结果（验收唯一真值；`verified == (exit==0)`） |
+| `success` | bool — trace 是否成功（步骤都成功，未必有 grounded 证据） |
+| `evidence` | `GROUNDED` \| `RAN` \| `FAILED` \| `NO_TRACE`（顶层证据等级） |
+| `goal` | 本 turn 的 goal（来自 GoalTree） |
+| `n_steps` / `n_grounded` | 步数 / 其中 GROUNDED 的步数 |
+| `oracle_names` | 本世界 live verify 命名空间的可调用名（与 GoalVerifier 同源） |
+| `per_step` | 每步 `{name, strategy, success, verify, verify_result, evidence}` |
+| `error` | 仅 NO_TRACE/错误时填写 |
+
+**退出码契约：** `0` = verified（GROUNDED）·`2` = ran-not-verified（RAN/FAILED）·`1` = error / NO_TRACE（chat/tool_use turn 无确定性 trace → fail-closed）。
+
+**测试驱动（确定性、无网络）：** `VECTOR_FAKE_LLM=<json-path>` 环境变量在**单一** `create_backend` 接缝
+(`create_backend_with_fake_seam`) 注入 `tests/harness/fake_backend.py::FakeBackend`，返回一份固定的 decompose 计划。
+它**只**替换网络 LLM —— 真实的 decomposer / validator / skill / GoalVerifier / 证据门 / 判定**全部照跑**，所以
+`verify='True'` 的假计划仍判 RAN → verified False（接缝绝不绕过任何 verify/permission 层）。未设该变量时，
+`create_backend` 行为与生产完全一致。
+
+**PTY 验收 + CI 门：** `tests/harness/pty_cli.py::run_cli_turn` 用 **stdlib `pty`**（不引入 pexpect 依赖）拉起真入口、
+读 `VECTOR_VERDICT`、断言 `verified == (exit==0)`。CI 门：`cli_main` + `capability` 两个 pytest marker 已注册
+(`pyproject.toml`)；`tests/conftest.py` 的 `pytest_collection_modifyitems` 会**判失败**任何带 `@capability` 却缺
+`@cli_main` 的测试（杜绝回退到绕过脚本）。
 
 ## ToolHookRegistry — 工具执行钩子
 
@@ -286,7 +347,7 @@ Nav stack: running
 电机技能（navigate、walk、pick）→ 始终 ask。
 只读工具（file_read、grep、ros2_topics）→ 始终 allow。
 
-## 完整工具清单 (17 内置 + 22 技能)
+## 完整工具清单 (19 内置 + 臂控技能)
 
 ### 内置工具
 
@@ -298,23 +359,25 @@ Nav stack: running
 | bash | code | 否 | ask | 执行 shell 命令 |
 | glob | code | 是 | allow | 按模式查找文件 |
 | grep | code | 是 | allow | 搜索文件内容 |
+| web_fetch | general | 是 | allow | 抓取 URL |
 | world_query | robot | 是 | allow | 查询世界模型对象 |
 | scene_graph_query | robot | 是 | allow | 查询房间/门/物体/路径 |
-| robot_status | system | 是 | allow | 硬件连接状态 |
-| start_simulation | system | 否 | ask | 启动 MuJoCo 仿真 |
-| web_fetch | system | 是 | allow | 抓取 URL |
-| skill_reload | system | 否 | ask | 热加载技能模块 |
 | ros2_topics | diag | 是 | allow | 列出/hz/echo ROS2 话题 |
 | ros2_nodes | diag | 是 | allow | 列出/info ROS2 节点 |
 | ros2_log | diag | 是 | allow | 读取机器人日志 |
 | nav_state | diag | 是 | allow | 导航/探索状态 |
 | terrain_status | diag | 是 | allow | 地形地图文件信息 |
+| start_simulation | sim | 否 | ask | 启动 MuJoCo 仿真 |
+| stop_simulation | sim | 否 | ask | 停止 MuJoCo 仿真 |
+| robot_status | system | 是 | allow | 硬件连接状态 |
+| skill_reload | system | 否 | ask | 热加载技能模块 |
+| open_foxglove | system | 是 | allow | 打开 Foxglove 可视化 |
 
-### 包装的机器人技能 (22 个)
+### 机械臂技能工具（接入臂控 agent 时动态注册，robot 类别，10 个）
 
-Walk, Turn, Stand, Sit, Lie Down, Stop, Explore, Navigate, Patrol,
-Look, Describe Scene, Where Am I, Home, Scan, Wave, Pick, Place,
-Handover, Detect, Describe, Gripper Open, Gripper Close
+连接 SO-101 arm agent（`vector-cli --sim` 或实体臂）时，以下技能自动包装为 robot 类别工具：
+
+home, wave, scan, detect, describe, pick, place, gripper_open, gripper_close, handover
 
 ## Session 持久化
 
@@ -363,6 +426,14 @@ vcli/
 │   ├── __init__.py         # LLMBackend Protocol + create_backend 工厂
 │   ├── anthropic.py        # Anthropic Messages API（流式）
 │   └── openai_compat.py    # OpenRouter / Ollama / vLLM
+├── cognitive/
+│   ├── vgg_harness.py        # VGG 主循环（复杂 NL 任务分解入口）
+│   ├── goal_decomposer.py    # NL → 子步骤计划
+│   ├── goal_executor.py      # 执行计划
+│   ├── goal_verifier.py      # 验证步骤结果
+│   ├── strategy_selector.py  # 策略选择
+│   ├── capabilities/         # 能力映射
+│   └── worlds/               # 世界模型适配
 └── tools/
     ├── base.py             # Tool Protocol, @tool 装饰器,
     │                       # ToolRegistry, CategorizedToolRegistry
@@ -371,11 +442,12 @@ vcli/
     ├── bash_tool.py        # bash
     ├── search_tools.py     # glob, grep
     ├── robot.py            # world_query, robot_status
-    ├── sim_tool.py         # start_simulation
+    ├── sim_tool.py         # start_simulation, stop_simulation
     ├── web_tool.py         # web_fetch
     ├── skill_wrapper.py    # SkillWrapperTool + wrap_skills() + 恢复提示
     ├── scene_graph_tool.py # scene_graph_query（7种查询）
     ├── ros2_tools.py       # ros2_topics, ros2_nodes, ros2_log
     ├── nav_tools.py        # nav_state, terrain_status
-    └── reload_tool.py      # skill_reload（热加载）
+    ├── reload_tool.py      # skill_reload（热加载）
+    └── foxglove_tool.py    # open_foxglove
 ```

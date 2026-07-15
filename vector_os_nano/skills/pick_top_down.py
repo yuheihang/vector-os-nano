@@ -243,6 +243,7 @@ class PickTopDownSkill:
 
         # IK — solve pre-grasp first, seed grasp from it for minimal joint change
         q_pre = arm.ik_top_down(pre_grasp)
+        logger.info("[PICK-TD] pre-grasp IK %s", "OK" if q_pre is not None else "FAIL")
         if q_pre is None:
             return SkillResult(
                 success=False,
@@ -286,7 +287,7 @@ class PickTopDownSkill:
                 result_data={"diagnosis": "move_failed", "phase": "descent"},
             )
 
-        logger.info("[PICK-TD] closing gripper")
+        logger.info("[PICK-TD] closing gripper at grasp=%s obj_xyz=%s", grasp, obj_xyz)
         gripper.close()
         time.sleep(_CLOSE_SETTLE)
 

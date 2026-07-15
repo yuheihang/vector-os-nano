@@ -130,6 +130,14 @@ _DOORCHAIN_WAYPOINT_TIMEOUT: float = _nav("waypoint_timeout", 30.0)
 
 _MIN_VISIT_COUNT: int = 1  # trust SceneGraph position after first visit
 
+# Coordinate-goal navigation (R38). A cross-room FAR leg takes ~30-50 s over the
+# lidar terrain map (probe v2: 32 s clean, 41 s through furniture), so the nav
+# budget must exceed that or the dog times out mid-drive. The VICINITY radius is
+# the step-success threshold (generous: FAR arrival radius 0.8 m + margin) — NOT
+# the honest arrival grade, which is the at_position(tol 0.5 m) verify oracle.
+_COORD_NAV_TIMEOUT_S: float = 90.0
+_COORD_VICINITY_RADIUS_M: float = 1.5
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -373,6 +381,18 @@ class NavigateSkill:
                 diagnosis_code="no_base",
             )
 
+        # --- Coordinate goal (R38): a navigate step may target a world COORDINATE
+        # rather than a named SceneGraph room (e.g. "去桌子那里" -> the table
+        # standoff, which has no room entry). When x/y (or target=[x, y]) are
+        # present, drive the FAR planner directly via base.navigate_to(x, y),
+        # bypassing room resolution. World-agnostic and additive — the named-room
+        # path below is unchanged when no coordinates are given. The step's
+        # at_position verify (graded RAN per D14) is the source of truth for
+        # arrival; we surface the actual position regardless of FAR's verdict.
+        coord = self._parse_coordinate(params)
+        if coord is not None:
+            return self._navigate_to_coordinate(coord, context)
+
         room_input = str(params.get("room", ""))
         sg = context.services.get("spatial_memory")
 
@@ -447,6 +467,122 @@ class NavigateSkill:
     # ------------------------------------------------------------------
     # Navigation modes (private)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_coordinate(params: dict) -> tuple[float, float] | None:
+        """Extract a world (x, y) coordinate goal from params, or None.
+
+        Accepts ``{"x": .., "y": ..}`` or ``{"target": [x, y]}`` /
+        ``{"goal": [x, y]}`` (a 2-list/tuple). Returns None when no coordinate is
+        present (the named-room path then runs) — back-compatible.
+        """
+        x = params.get("x")
+        y = params.get("y")
+        if x is not None and y is not None:
+            try:
+                return (float(x), float(y))
+            except (TypeError, ValueError):
+                return None
+        for key in ("target", "goal", "coordinate", "coord"):
+            val = params.get(key)
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                try:
+                    return (float(val[0]), float(val[1]))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _navigate_to_coordinate(
+        self,
+        coord: tuple[float, float],
+        context: SkillContext,
+    ) -> SkillResult:
+        """Drive the base to a world coordinate via the FAR planner (navigate_to).
+
+        Used for a coordinate navigate goal (no SceneGraph room). Honest: the
+        step's success is the planner's own arrival verdict and the actual landing
+        position is reported; the at_position verify oracle (RAN) is what grades the
+        step. If the base lacks navigate_to (no nav stack) we fail loud.
+        """
+        base = context.base
+        tx, ty = coord
+        navigate_to = getattr(base, "navigate_to", None)
+        if not callable(navigate_to):
+            return SkillResult(
+                success=False,
+                error_message="Coordinate navigation needs a nav stack (base.navigate_to absent).",
+                diagnosis_code="navigation_failed",
+            )
+
+        # Ensure the bridge path follower is armed (same as the room path).
+        try:
+            import os
+            if not os.path.exists("/tmp/vector_nav_active"):
+                with open("/tmp/vector_nav_active", "w") as fh:
+                    fh.write("1")
+        except Exception:
+            pass
+
+        logger.info("[NAV] Coordinate goal -> navigate_to(%.2f, %.2f) via FAR", tx, ty)
+
+        def _progress(dist: float, elapsed: float) -> None:
+            print(f"  >> 距目标 {dist:.1f}m, 已走 {int(elapsed)}s",
+                  file=sys.stderr, flush=True)
+
+        try:
+            ok = bool(navigate_to(tx, ty, timeout=_COORD_NAV_TIMEOUT_S, on_progress=_progress))
+        except TypeError:
+            # A base whose navigate_to does not accept the extra kwargs.
+            ok = bool(navigate_to(tx, ty))
+
+        # HOLD at the goal. navigate_to leaves the dog under the planner/TARE,
+        # which keeps publishing /way_point and DRIFTS the dog away from the goal
+        # (observed: dog wandered to (7.7, 4.5) before the next skill perceived).
+        # A downstream manipulation step needs the dog STATIONARY at the table, so
+        # disarm the nav flag and stop the base now. (Symmetric with how a stop
+        # command clears the flag; the proxy's loops treat the missing flag as
+        # "no active nav".)
+        try:
+            import os
+            if os.path.exists("/tmp/vector_nav_active"):
+                os.remove("/tmp/vector_nav_active")
+        except Exception:
+            pass
+        stop = getattr(base, "stop", None) or getattr(base, "set_velocity", None)
+        if callable(stop):
+            try:
+                if stop is getattr(base, "set_velocity", None):
+                    stop(0.0, 0.0, 0.0)
+                else:
+                    stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[NAV] coord-nav stop failed: %s", exc)
+
+        pos = base.get_position()
+        dist = _distance(pos[0], pos[1], tx, ty)
+        # The skill SUCCEEDS when it ran and the dog is in the goal's VICINITY — FAR
+        # may time out / not raise its arrival flag yet still leave the dog close
+        # (it drives over a lidar terrain map at variable speed). Step success only
+        # gates whether DEPENDENTS run; the honest arrival grade is the at_position
+        # verify oracle (RAN, tol 0.5 m). So we use a GENEROUS vicinity radius here
+        # (the FAR arrival radius 0.8 m + margin) — not a strict re-check — to avoid
+        # falsely failing the chain when the dog is geometrically at the table but
+        # FAR's bool timed out. Genuinely-far (FAR couldn't route) -> still fail loud.
+        arrived = ok or dist <= _COORD_VICINITY_RADIUS_M
+        return SkillResult(
+            success=arrived,
+            error_message="" if arrived else (
+                f"navigate_to({tx}, {ty}) did not reach the goal vicinity "
+                f"(ended {dist:.1f} m away)"),
+            diagnosis_code=None if arrived else "navigation_failed",
+            result_data={
+                "target": [round(tx, 1), round(ty, 1)],
+                "position": [round(pos[0], 1), round(pos[1], 1)],
+                "distance_to_target": round(dist, 1),
+                "far_confirmed": ok,
+                "mode": "proxy_coord",
+            },
+        )
 
     def _navigate_with_proxy(
         self,

@@ -28,12 +28,57 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+# TEMP DIAGNOSTIC (off unless VECTOR_MPC_LOG set): count/log swallowed MPC solver
+# failures so the explore "float" can be checked for silently-failing QP solves
+# (the _physics_step_mpc except: pass would otherwise hide them → stale torque →
+# float). Remove after debugging.
+_MPC_DIAG: dict[str, int] = {"qp_ok": 0, "qp_fail": 0, "tau_fail": 0}
+
+# TEMP DIAGNOSTIC (off unless VECTOR_PHYS_LOG set): every ~2s log sim-time/wall
+# rate + count of live "mujoco_go2_physics" daemons — directly detects duplicate
+# stepping (rate ~2x / daemons>1) or a stalled daemon (rate<<1). Remove after debug.
+_PHYS_DIAG: dict[str, float] = {"last_wall": 0.0, "last_sim": 0.0}
+
+
+def _phys_diag(sim_time: float) -> None:
+    _p = os.environ.get("VECTOR_PHYS_LOG", "")
+    if not _p:
+        return
+    now = time.perf_counter()
+    lw = _PHYS_DIAG["last_wall"]
+    if lw and (now - lw) < 2.0:
+        return
+    rate = ((sim_time - _PHYS_DIAG["last_sim"]) / (now - lw)) if lw else 0.0
+    _PHYS_DIAG["last_wall"] = now
+    _PHYS_DIAG["last_sim"] = sim_time
+    n = sum(1 for t in threading.enumerate() if t.name == "mujoco_go2_physics")
+    try:
+        with open(_p, "a") as _f:
+            _f.write(f"{now:.3f}\tsim_time={sim_time:.3f}\tsim/wall={rate:.2f}x\tphysics_daemons={n}\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _mpc_diag(kind: str, exc: BaseException | None = None) -> None:
+    _MPC_DIAG[kind] = _MPC_DIAG.get(kind, 0) + 1
+    _p = os.environ.get("VECTOR_MPC_LOG", "")
+    if _p:
+        try:
+            with open(_p, "a") as _f:
+                _f.write(
+                    f"{time.time():.4f}\t{kind}\t"
+                    f"{type(exc).__name__ if exc else ''}\t{str(exc)[:140] if exc else ''}\n"
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +314,20 @@ def _build_room_scene_xml(with_arm: bool | None = None) -> Path:
     xml = template.replace("GO2_MODEL_PATH", str(go2_xml))
     xml = xml.replace("GO2_ASSETS_DIR", str(assets_dir))
 
+    # Grasp welds — only with the arm (the no-arm model has no piper_link6, and a
+    # weld to a missing body fails to compile). body1=piper_link6 (wrist carrying
+    # piper_ee_site + fingers), body2=each pickable; active="false" until the
+    # gripper's _try_grasp activates one on close. This is what lets a grasp grade
+    # GROUNDED — the object physically attaches + lifts (mirrors so101_mujoco.xml).
+    welds = (
+        "  <equality>\n"
+        '    <weld name="grasp_pickable_bottle_blue"  body1="piper_link6" body2="pickable_bottle_blue"  active="false"/>\n'
+        '    <weld name="grasp_pickable_bottle_green" body1="piper_link6" body2="pickable_bottle_green" active="false"/>\n'
+        '    <weld name="grasp_pickable_can_red"      body1="piper_link6" body2="pickable_can_red"      active="false"/>\n'
+        "  </equality>\n"
+    ) if with_arm else ""
+    xml = xml.replace("GRASP_WELDS", welds)
+
     out = _MJCF_DIR / scene_name
     out.write_text(xml)
     return out
@@ -387,6 +446,21 @@ class MuJoCoGo2:
         self._last_pointcloud: list = []
         self._scan_counter: int = 0
 
+        # Viewer drive mode (resolved in connect()): one of "main_thread_pump"
+        # (macOS/mjpython), "background_daemon" (Linux/Windows window) or
+        # "headless". Decides whether physics runs on the daemon thread or is
+        # pumped by the caller's (viewer-owning) thread. See hardware/sim/
+        # viewer_mode.py for the platform-aware seam.
+        self._drive_mode: str = "headless"
+        # Per-step physics state, lifted out of the loop locals so a single
+        # step() can advance one increment statefully for the main-thread pump.
+        self._tau_hold: np.ndarray = np.zeros(12, dtype=float)
+        self._sim_step: int = 0
+        self._mpc_U_opt: Any = None
+        self._mpc_ctrl_i: int = 0
+        self._mpc_steps_per_mpc: int = 1
+        self._mpc_dt: float = 0.0
+
         # Skill-level exclusive control gate. walk()/turn() set this
         # to acquire control for the duration of a motion. During that
         # window, set_velocity() rejects writes from any thread OTHER
@@ -397,6 +471,19 @@ class MuJoCoGo2:
         # the token (tid match).
         self._skill_ctrl_until: float = 0.0
         self._skill_ctrl_tid: int = 0
+
+        # R2b actor-causation instrumentation. Bumped in set_velocity ONLY for
+        # writes that pass the skill-exclusive ``_gated`` guard (an UNGATED command —
+        # i.e. one issued by a walk()/turn() skill on the token thread, or by any
+        # caller when no skill holds the token). ``_cmd_writes`` is the count;
+        # ``_cmd_motion`` is the cumulative |vx|+|vy|+|vyaw| MAGNITUDE — the signal
+        # the grader keys on, so a terminal set_velocity(0,0,0) stop (a write, zero
+        # magnitude) never satisfies causation. A GATED write (the bridge/nav
+        # cmd_vel path, rejected before reaching the actuators) is NOT counted, so
+        # the live navigate route reads as zero commanded motion (scoped OUT — see
+        # actor_causation docstring). Read via ``cmd_motion()`` (snapshot value).
+        self._cmd_writes: int = 0
+        self._cmd_motion: float = 0.0
 
     # ------------------------------------------------------------------
     # Capability properties (BaseProtocol)
@@ -498,7 +585,12 @@ class MuJoCoGo2:
             except Exception as exc:
                 if self._backend_pref == "mpc":
                     raise RuntimeError(f"MPC backend requested but failed: {exc}") from exc
-                logger.info("MuJoCoGo2: convex_mpc not available, using sinusoidal gait")
+                # LOUD (was info → silent): the dog walks far worse on the fallback,
+                # so surface WHY + the fix instead of hiding it (tricky-bugs Case 0).
+                logger.warning(
+                    "MuJoCoGo2: convex-MPC gait unavailable (%s) — falling back to "
+                    "the sinusoidal gait. Install the Go2 MPC deps for the real gait: "
+                    "`uv pip install -e .[go2]` (casadi + pin).", exc)
 
         backend_name = "mpc" if self._use_mpc else "sinusoidal"
         logger.info(
@@ -506,12 +598,28 @@ class MuJoCoGo2:
             self._gui, self._room, backend_name,
         )
 
-        # Start background physics thread
-        self._running = True
-        self._physics_thread = threading.Thread(
-            target=self._physics_loop, daemon=True, name="mujoco_go2_physics"
+        # Resolve how the viewer (if any) is driven, then start physics.
+        # macOS/mjpython window -> NO background daemon: the caller pumps step()
+        # on the viewer-owning (main) thread, because Apple GLFW is main-thread
+        # only and a background viewer.sync() would segfault. Linux/Windows
+        # window + headless -> background daemon, byte-identical to before.
+        from vector_os_nano.hardware.sim.viewer_mode import (  # noqa: PLC0415
+            resolve_viewer_drive_mode,
+            uses_background_physics,
         )
-        self._physics_thread.start()
+        self._drive_mode = resolve_viewer_drive_mode(self._viewer is not None)
+        self._reset_step_state()
+        self._running = True
+        if uses_background_physics(self._drive_mode):
+            self._physics_thread = threading.Thread(
+                target=self._physics_loop, daemon=True, name="mujoco_go2_physics"
+            )
+            self._physics_thread.start()
+        else:
+            logger.info(
+                "MuJoCoGo2: viewer on the main thread (mjpython) — physics "
+                "driven by the caller's step() pump, no background thread"
+            )
 
     def disconnect(self) -> None:
         """Stop physics thread, close viewer and release model."""
@@ -552,11 +660,80 @@ class MuJoCoGo2:
             self._physics_thread = None
 
     def _resume_physics(self) -> None:
+        from vector_os_nano.hardware.sim.viewer_mode import (  # noqa: PLC0415
+            uses_background_physics,
+        )
+        # In main-thread-pump mode there is no daemon to restart — the caller
+        # keeps pumping step(). Restarting a thread here would reintroduce the
+        # off-main-thread GLFW hazard the pump mode exists to avoid.
+        if not uses_background_physics(self._drive_mode):
+            self._running = True
+            return
+        self._reset_step_state()
         self._running = True
         self._physics_thread = threading.Thread(
             target=self._physics_loop, daemon=True, name="mujoco_go2_physics"
         )
         self._physics_thread.start()
+
+    def _reset_step_state(self) -> None:
+        """(Re)initialize per-step physics state before (re)starting physics.
+
+        Matches the original fresh-locals semantics of the physics loops so the
+        background-daemon path is byte-identical; the main-thread pump relies on
+        the same state persisting across step() calls.
+        """
+        self._tau_hold = np.zeros(12, dtype=float)
+        self._sim_step = 0
+        self._scan_counter = 0
+        self._mpc_U_opt = None
+        self._mpc_ctrl_i = 0
+        if self._use_mpc and self._gait is not None:
+            gait_period = self._gait.gait_period
+            self._mpc_dt = gait_period / _MPC_DT_FACTOR
+            mpc_hz = 1.0 / self._mpc_dt
+            self._mpc_steps_per_mpc = max(1, int(_CTRL_HZ // mpc_hz))
+        else:
+            self._mpc_dt = 0.0
+            self._mpc_steps_per_mpc = 1
+
+    def step(self, n: int = 1) -> None:
+        """Advance physics by *n* increments on the CALLER's thread.
+
+        This is the main-thread pump used on macOS/mjpython, where GLFW is
+        main-thread-only and the background daemon must not touch the viewer.
+        Mirrors :meth:`MuJoCoArm.step`. On Linux/Windows/headless the background
+        daemon drives the same per-step bodies and callers never pump.
+        """
+        self._require_connection()
+        for _ in range(n):
+            if self._use_mpc:
+                self._physics_step_mpc()
+            else:
+                self._physics_step_sinusoidal()
+
+    def _drive_for(self, seconds: float) -> None:
+        """Advance ~*seconds* of real time while a blocking motion runs.
+
+        Daemon mode (Linux/Windows/headless): the background thread is already
+        stepping the gait, so just sleep. Main-thread-pump mode (macOS/mjpython):
+        drive :meth:`step` on THIS (the caller's = the viewer-owning main) thread
+        so the gait animates and the viewer syncs on the main thread, instead of
+        sleeping while a non-existent daemon would have stepped.
+        """
+        from vector_os_nano.hardware.sim.viewer_mode import (  # noqa: PLC0415
+            uses_background_physics,
+        )
+        if uses_background_physics(self._drive_mode):
+            time.sleep(seconds)
+            return
+        deadline = time.perf_counter() + seconds
+        while time.perf_counter() < deadline:
+            loop_start = time.perf_counter()
+            self.step()
+            sleep_t = _SIM_DT - (time.perf_counter() - loop_start)
+            if sleep_t > 0:
+                time.sleep(sleep_t)
 
     # ------------------------------------------------------------------
     # Background physics loop
@@ -570,6 +747,12 @@ class MuJoCoGo2:
         slices the leg portion out of qpos/qvel. Only the reverse is an
         unrecoverable mismatch.
         """
+        # EAGER dep check (tricky-bugs Case 0: "Go2 won't walk — casadi missing"):
+        # casadi is imported LAZILY by convex_mpc.centroidal_mpc on the FIRST solve,
+        # so without this line a missing casadi sets _use_mpc=True at connect and the
+        # QP then fails EVERY tick silently (qp_fail, no torque, no walk). Importing
+        # it here makes a missing casadi raise at connect → loud fallback below.
+        import casadi  # noqa: F401,PLC0415
         from convex_mpc.go2_robot_data import PinGo2Model  # noqa: PLC0415
         from convex_mpc.gait import Gait                   # noqa: PLC0415
         from convex_mpc.com_trajectory import ComTraj       # noqa: PLC0415
@@ -599,159 +782,166 @@ class MuJoCoGo2:
             self._physics_loop_sinusoidal()
 
     def _physics_loop_sinusoidal(self) -> None:
-        """Physics loop using sinusoidal trotting gait (Backend A)."""
-        mj = _get_mujoco()
+        """Background physics loop (sinusoidal trotting gait, Backend A).
 
-        tau_hold: np.ndarray = np.zeros(12, dtype=float)
-        sim_step: int = 0
-        scan_counter: int = 0
-
+        Drives one :meth:`_physics_step_sinusoidal` per iteration at ~1 kHz on
+        the daemon thread (Linux/Windows window + headless).
+        """
         while self._running:
             loop_start = time.perf_counter()
-
-            with self._cmd_lock:
-                vx, vy, vyaw = self._cmd_vel
-
-            time_now = float(self._mj.data.time)
-            is_moving = (vx != 0.0 or vy != 0.0 or vyaw != 0.0)
-
-            if sim_step % _CTRL_DECIM == 0:
-                q_cur = np.array(self._mj.data.qpos[7:19], dtype=np.float64)
-                dq_cur = np.array(self._mj.data.qvel[6:18], dtype=np.float64)
-
-                if is_moving:
-                    q_target = _compute_gait_targets(time_now, vx, vy, vyaw)
-                else:
-                    q_target = np.array(_STAND_JOINTS, dtype=np.float64)
-
-                tau = _KP * (q_target - q_cur) - _KD * dq_cur
-                tau = np.clip(tau, -_TAU_LIMITS, _TAU_LIMITS)
-                tau_hold = tau.copy()
-
-            mj.mj_step1(self._mj.model, self._mj.data)
-            self._mj.set_joint_torque(tau_hold)
-            mj.mj_step2(self._mj.model, self._mj.data)
-
-            self._update_odometry()
-
-            scan_counter += 1
-            if scan_counter >= _LIDAR_UPDATE_INTERVAL:
-                self._update_lidar()
-                scan_counter = 0
-
-            if self._viewer is not None and sim_step % _VIEWER_SYNC_EVERY == 0:
-                if self._viewer_track:
-                    pos = self._mj.data.qpos[0:3]
-                    self._viewer.cam.lookat[:] = [float(pos[0]), float(pos[1]), 0.3]
-                self._viewer.sync()
-
-            sim_step += 1
-
+            self._physics_step_sinusoidal()
+            _phys_diag(float(self._mj.data.time))
             elapsed = time.perf_counter() - loop_start
             sleep_time = _SIM_DT - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    def _physics_loop_mpc(self) -> None:
-        """Physics loop using convex MPC locomotion (Backend B).
+    def _physics_step_sinusoidal(self) -> None:
+        """Advance ONE sinusoidal-gait physics increment (+ optional viewer sync).
 
-        Ported from the original convex_mpc-based implementation.
-        MPC computes optimal contact forces, leg controller converts to torques.
+        Stateful via ``self`` (``_tau_hold`` / ``_sim_step`` / ``_scan_counter``)
+        so it can be driven either by the background daemon loop OR by the
+        main-thread :meth:`step` pump.
         """
         mj = _get_mujoco()
 
-        gait_period = self._gait.gait_period
-        mpc_dt = gait_period / _MPC_DT_FACTOR
-        mpc_hz = 1.0 / mpc_dt
-        steps_per_mpc = max(1, int(_CTRL_HZ // mpc_hz))
+        with self._cmd_lock:
+            vx, vy, vyaw = self._cmd_vel
 
-        U_opt: Any = None
-        ctrl_i: int = 0
-        tau_hold: np.ndarray = np.zeros(12, dtype=float)
-        sim_step: int = 0
-        scan_counter: int = 0
+        time_now = float(self._mj.data.time)
+        is_moving = (vx != 0.0 or vy != 0.0 or vyaw != 0.0)
 
+        if self._sim_step % _CTRL_DECIM == 0:
+            q_cur = np.array(self._mj.data.qpos[7:19], dtype=np.float64)
+            dq_cur = np.array(self._mj.data.qvel[6:18], dtype=np.float64)
+
+            if is_moving:
+                q_target = _compute_gait_targets(time_now, vx, vy, vyaw)
+            else:
+                q_target = np.array(_STAND_JOINTS, dtype=np.float64)
+
+            tau = _KP * (q_target - q_cur) - _KD * dq_cur
+            tau = np.clip(tau, -_TAU_LIMITS, _TAU_LIMITS)
+            self._tau_hold = tau.copy()
+
+        mj.mj_step1(self._mj.model, self._mj.data)
+        self._mj.set_joint_torque(self._tau_hold)
+        mj.mj_step2(self._mj.model, self._mj.data)
+
+        self._update_odometry()
+
+        self._scan_counter += 1
+        if self._scan_counter >= _LIDAR_UPDATE_INTERVAL:
+            self._update_lidar()
+            self._scan_counter = 0
+
+        if self._viewer is not None and self._sim_step % _VIEWER_SYNC_EVERY == 0:
+            if self._viewer_track:
+                pos = self._mj.data.qpos[0:3]
+                self._viewer.cam.lookat[:] = [float(pos[0]), float(pos[1]), 0.3]
+            self._viewer.sync()
+
+        self._sim_step += 1
+
+    def _physics_loop_mpc(self) -> None:
+        """Background physics loop (convex MPC locomotion, Backend B).
+
+        Drives one :meth:`_physics_step_mpc` per iteration at ~1 kHz on the
+        daemon thread (Linux/Windows window + headless).
+        """
         while self._running:
             loop_start = time.perf_counter()
-
-            with self._cmd_lock:
-                vx, vy, vyaw = self._cmd_vel
-
-            time_now = float(self._mj.data.time)
-            is_moving = (vx != 0.0 or vy != 0.0 or vyaw != 0.0)
-
-            if sim_step % _CTRL_DECIM == 0:
-                # Update Pinocchio model from MuJoCo state
-                self._mj_update_pin()
-
-                if is_moving:
-                    # MPC locomotion — with solver failure protection
-                    if ctrl_i % steps_per_mpc == 0:
-                        try:
-                            self._traj.generate_traj(
-                                self._pin, self._gait, time_now,
-                                vx, vy, _MPC_Z_DES, vyaw, time_step=mpc_dt,
-                            )
-                            if self._mpc is None:
-                                from convex_mpc.centroidal_mpc import CentroidalMPC  # noqa: PLC0415
-                                self._mpc = CentroidalMPC(self._pin, self._traj)
-
-                            sol = self._mpc.solve_QP(self._pin, self._traj, False)
-                            n = self._traj.N
-                            w_opt = sol["x"].full().flatten()
-                            U_opt = w_opt[12 * n:].reshape((12, n), order="F")
-                        except Exception:
-                            # QP solver failed — hold current torque (PD fallback)
-                            pass
-
-                    if U_opt is not None:
-                        try:
-                            mpc_force = U_opt[:, 0]
-                            tau = np.zeros(12, dtype=float)
-                            for i, leg in enumerate(_MPC_LEG_NAMES):
-                                leg_out = self._leg_ctrl.compute_leg_torque(
-                                    leg, self._pin, self._gait,
-                                    mpc_force[i * 3:(i + 1) * 3], time_now,
-                                )
-                                tau[i * 3:(i + 1) * 3] = leg_out.tau
-                            tau = np.clip(tau, -_MPC_TAU_LIMITS, _MPC_TAU_LIMITS)
-                            tau_hold = tau.copy()
-                        except Exception:
-                            pass
-                else:
-                    # Idle: PD hold standing posture
-                    q_cur = np.array(self._mj.data.qpos[7:19], dtype=np.float64)
-                    dq_cur = np.array(self._mj.data.qvel[6:18], dtype=np.float64)
-                    q_stand = np.array(_STAND_JOINTS, dtype=np.float64)
-                    tau = _KP * (q_stand - q_cur) - _KD * dq_cur
-                    tau = np.clip(tau, -_TAU_LIMITS, _TAU_LIMITS)
-                    tau_hold = tau.copy()
-
-                ctrl_i += 1
-
-            mj.mj_step1(self._mj.model, self._mj.data)
-            self._mj.set_joint_torque(tau_hold)
-            mj.mj_step2(self._mj.model, self._mj.data)
-
-            self._update_odometry()
-
-            scan_counter += 1
-            if scan_counter >= _LIDAR_UPDATE_INTERVAL:
-                self._update_lidar()
-                scan_counter = 0
-
-            if self._viewer is not None and sim_step % _VIEWER_SYNC_EVERY == 0:
-                if self._viewer_track:
-                    pos = self._mj.data.qpos[0:3]
-                    self._viewer.cam.lookat[:] = [float(pos[0]), float(pos[1]), 0.3]
-                self._viewer.sync()
-
-            sim_step += 1
-
+            self._physics_step_mpc()
+            _phys_diag(float(self._mj.data.time))
             elapsed = time.perf_counter() - loop_start
             sleep_time = _SIM_DT - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+    def _physics_step_mpc(self) -> None:
+        """Advance ONE convex-MPC physics increment (+ optional viewer sync).
+
+        Ported from the original convex_mpc-based loop: MPC computes optimal
+        contact forces, the leg controller converts them to torques. Stateful
+        via ``self`` so it can be driven by the daemon loop OR the :meth:`step`
+        pump.
+        """
+        mj = _get_mujoco()
+
+        with self._cmd_lock:
+            vx, vy, vyaw = self._cmd_vel
+
+        time_now = float(self._mj.data.time)
+        is_moving = (vx != 0.0 or vy != 0.0 or vyaw != 0.0)
+
+        if self._sim_step % _CTRL_DECIM == 0:
+            # Update Pinocchio model from MuJoCo state
+            self._mj_update_pin()
+
+            if is_moving:
+                # MPC locomotion — with solver failure protection
+                if self._mpc_ctrl_i % self._mpc_steps_per_mpc == 0:
+                    try:
+                        self._traj.generate_traj(
+                            self._pin, self._gait, time_now,
+                            vx, vy, _MPC_Z_DES, vyaw, time_step=self._mpc_dt,
+                        )
+                        if self._mpc is None:
+                            from convex_mpc.centroidal_mpc import CentroidalMPC  # noqa: PLC0415
+                            self._mpc = CentroidalMPC(self._pin, self._traj)
+
+                        sol = self._mpc.solve_QP(self._pin, self._traj, False)
+                        n = self._traj.N
+                        w_opt = sol["x"].full().flatten()
+                        self._mpc_U_opt = w_opt[12 * n:].reshape((12, n), order="F")
+                        _mpc_diag("qp_ok")
+                    except Exception as _exc:  # noqa: BLE001
+                        # QP solver failed — hold current torque (PD fallback)
+                        _mpc_diag("qp_fail", _exc)
+
+                if self._mpc_U_opt is not None:
+                    try:
+                        mpc_force = self._mpc_U_opt[:, 0]
+                        tau = np.zeros(12, dtype=float)
+                        for i, leg in enumerate(_MPC_LEG_NAMES):
+                            leg_out = self._leg_ctrl.compute_leg_torque(
+                                leg, self._pin, self._gait,
+                                mpc_force[i * 3:(i + 1) * 3], time_now,
+                            )
+                            tau[i * 3:(i + 1) * 3] = leg_out.tau
+                        tau = np.clip(tau, -_MPC_TAU_LIMITS, _MPC_TAU_LIMITS)
+                        self._tau_hold = tau.copy()
+                    except Exception as _exc:  # noqa: BLE001
+                        _mpc_diag("tau_fail", _exc)
+            else:
+                # Idle: PD hold standing posture
+                q_cur = np.array(self._mj.data.qpos[7:19], dtype=np.float64)
+                dq_cur = np.array(self._mj.data.qvel[6:18], dtype=np.float64)
+                q_stand = np.array(_STAND_JOINTS, dtype=np.float64)
+                tau = _KP * (q_stand - q_cur) - _KD * dq_cur
+                tau = np.clip(tau, -_TAU_LIMITS, _TAU_LIMITS)
+                self._tau_hold = tau.copy()
+
+            self._mpc_ctrl_i += 1
+
+        mj.mj_step1(self._mj.model, self._mj.data)
+        self._mj.set_joint_torque(self._tau_hold)
+        mj.mj_step2(self._mj.model, self._mj.data)
+
+        self._update_odometry()
+
+        self._scan_counter += 1
+        if self._scan_counter >= _LIDAR_UPDATE_INTERVAL:
+            self._update_lidar()
+            self._scan_counter = 0
+
+        if self._viewer is not None and self._sim_step % _VIEWER_SYNC_EVERY == 0:
+            if self._viewer_track:
+                pos = self._mj.data.qpos[0:3]
+                self._viewer.cam.lookat[:] = [float(pos[0]), float(pos[1]), 0.3]
+            self._viewer.sync()
+
+        self._sim_step += 1
 
     def _mj_update_pin(self) -> None:
         """Sync Pinocchio model state from MuJoCo qpos/qvel.
@@ -796,15 +986,47 @@ class MuJoCoGo2:
         or turn() in progress. The token holder (same thread) passes.
         """
         self._require_connection()
-        if (time.time() < self._skill_ctrl_until
-                and threading.get_ident() != self._skill_ctrl_tid):
+        _gated = (time.time() < self._skill_ctrl_until
+                  and threading.get_ident() != self._skill_ctrl_tid)
+        # TEMP DIAGNOSTIC (off unless VECTOR_CMDVEL_LOG is set): record the full
+        # command stream — source thread + values + skill-gate state — so the
+        # explore "weird gait" can be checked for bursty/duplicate/conflicting
+        # set_velocity traffic from the bridge/nav stack. Remove after debugging.
+        _dbg = os.environ.get("VECTOR_CMDVEL_LOG", "")
+        if _dbg:
+            try:
+                with open(_dbg, "a") as _f:
+                    _f.write(
+                        f"{time.time():.4f}\t{threading.current_thread().name}\t"
+                        f"vx={vx:+.3f}\tvy={vy:+.3f}\tvyaw={vyaw:+.3f}\tgated={int(_gated)}\n"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        if _gated:
             return
         with self._cmd_lock:
-            self._cmd_vel = (
-                float(np.clip(vx, -_VX_MAX, _VX_MAX)),
-                float(np.clip(vy, -_VY_MAX, _VY_MAX)),
-                float(np.clip(vyaw, -_VYAW_MAX, _VYAW_MAX)),
-            )
+            cvx = float(np.clip(vx, -_VX_MAX, _VX_MAX))
+            cvy = float(np.clip(vy, -_VY_MAX, _VY_MAX))
+            cvyaw = float(np.clip(vyaw, -_VYAW_MAX, _VYAW_MAX))
+            self._cmd_vel = (cvx, cvy, cvyaw)
+            # R2b: count this UNGATED command and accumulate its magnitude. A
+            # stop (0,0,0) adds a write but zero magnitude, so it never satisfies
+            # the grader's MOTION_EPS threshold (which keys on _cmd_motion).
+            self._cmd_writes += 1
+            self._cmd_motion += abs(cvx) + abs(cvy) + abs(cvyaw)
+
+    def cmd_motion(self) -> float:
+        """Cumulative UNGATED commanded-velocity magnitude (R2b actor-causation).
+
+        The sum of ``|vx|+|vy|+|vyaw|`` over every ``set_velocity`` call that passed
+        the skill-exclusive gate (a real motor command — a walk()/turn() skill's
+        own writes, or any write when no skill holds the token). The grader takes a
+        baseline snapshot before a step and a post snapshot after, treating a
+        delta >= ``MOTION_EPS`` as "the actor commanded motion". A terminal
+        ``set_velocity(0,0,0)`` adds nothing to this sum, so a step that only
+        stopped never reads as commanded motion. Monotonically non-decreasing.
+        """
+        return float(self._cmd_motion)
 
     # ------------------------------------------------------------------
     # State queries
@@ -836,6 +1058,19 @@ class MuJoCoGo2:
         if self._mj.model.nu >= 19:
             data.ctrl[12:19] = _PIPER_STOW_CTRL
         mj.mj_forward(self._mj.model, data)
+
+    def get_sim_time(self) -> float:
+        """Return the MuJoCo simulation clock (seconds).
+
+        The physics daemon advances this as it steps; it runs at whatever
+        fraction of wall-clock the machine sustains (often <1x). Consumed by
+        the ROS2 bridge's path follower to integrate its velocity ramps
+        against sim-dt (wall-tick ramps slew too fast in gait time when
+        sim/wall<1 and destabilize it); also usable as a ``/clock`` source if
+        the nav stack ever moves to use_sim_time=true.
+        """
+        self._require_connection()
+        return float(self._mj.data.time)
 
     def get_position(self) -> list[float]:
         """Return base position [x, y, z] in world frame."""
@@ -961,6 +1196,55 @@ class MuJoCoGo2:
         rgb = self.get_camera_frame(width, height)
         depth = self.get_depth_frame(width, height)
         return rgb, depth
+
+    def get_self_mask(
+        self, width: int = 640, height: int = 480,
+    ) -> "np.ndarray":
+        """Bool (H, W) mask of pixels showing the robot's OWN Piper arm geoms.
+
+        Segmentation render on the d435_rgb camera → per-pixel geom id → True where
+        the geom's body name starts with 'piper'. The honest real-robot self-filter
+        (by IDENTITY, pose/colour/group-agnostic): the arm at rest occludes the table
+        in the head camera and would otherwise be picked as the grasp target (D30 —
+        site/geom-group hides are no-ops after MjSpec.attach). Used by the perception
+        backend to drop the arm's pixels before object detection.
+        """
+        self._require_connection()
+        mj = _get_mujoco()
+        import numpy as np
+        model = self._mj.model
+        if not hasattr(self, "_seg_renderer"):
+            self._seg_renderer = mj.Renderer(model, height, width)
+            self._seg_renderer.enable_segmentation_rendering()
+        if not hasattr(self, "_piper_geom_ids"):
+            # Collect EVERY body in the arm subtree (descendants of piper_base_link),
+            # not just "piper*"-named ones — the gripper/finger bodies are named
+            # differently and a name-prefix filter misses them (R15: caught only 21px,
+            # leaving the gripper as a distractor). Walk each body's parent chain to
+            # the arm root; include its geoms. Pose/colour/group/name-agnostic.
+            root = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "piper_base_link")
+            arm_bodies: set[int] = set()
+            if root >= 0:
+                for b in range(model.nbody):
+                    x = b
+                    while x > 0:
+                        if x == root:
+                            arm_bodies.add(b)
+                            break
+                        x = int(model.body_parentid[x])
+            ids = [
+                g for g in range(model.ngeom)
+                if int(model.geom_bodyid[g]) in arm_bodies
+                or (mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[g])) or "").startswith("piper")
+            ]
+            self._piper_geom_ids = np.asarray(ids, dtype=np.int32)
+        cam_id = model.cam("d435_rgb").id
+        self._seg_renderer.update_scene(self._mj.data, camera=cam_id)
+        seg = self._seg_renderer.render()  # (H, W, 2): [...,0] = geom id, -1 = none
+        geom_ids = seg[:, :, 0] if seg.ndim == 3 else seg
+        if self._piper_geom_ids.size == 0:
+            return np.zeros(geom_ids.shape, dtype=bool)
+        return np.isin(geom_ids, self._piper_geom_ids)
 
     # ------------------------------------------------------------------
     # Sensor update helpers
@@ -1207,9 +1491,9 @@ class MuJoCoGo2:
         self._skill_ctrl_until = time.time() + duration + 0.3
         try:
             self.set_velocity(vx, vy, vyaw)
-            time.sleep(duration)
+            self._drive_for(duration)
             self.set_velocity(0.0, 0.0, 0.0)
-            time.sleep(0.2)  # settle
+            self._drive_for(0.2)  # settle
             pos = self.get_position()
             return bool(pos[2] > 0.15)
         finally:

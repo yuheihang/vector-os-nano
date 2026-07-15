@@ -166,6 +166,14 @@ class MuJoCoPiper:
         # Lock for ctrl writes against concurrent stop() / skill interleaving
         self._ctrl_lock = threading.Lock()
 
+        # R2b actor-causation instrumentation. ``move_joints`` bumps these as it
+        # drives the ctrl set-points toward the target. ``_ctrl_writes`` counts the
+        # interpolation writes; ``_ctrl_motion`` accumulates the commanded |ctrl
+        # delta| MAGNITUDE so a no-op move_joints(current_pose) (zero delta) never
+        # satisfies the grader. Read via ``ctrl_motion()`` (snapshot value).
+        self._ctrl_writes: int = 0
+        self._ctrl_motion: float = 0.0
+
     # ------------------------------------------------------------------
     # ArmProtocol properties
     # ------------------------------------------------------------------
@@ -290,6 +298,27 @@ class MuJoCoPiper:
         data = self._go2._mj.data
         return [float(data.qpos[adr]) for adr in self._arm_joint_qpos_adr]
 
+    def get_object_positions(self) -> dict[str, list[float]]:
+        """Free-body object world positions {body_name: [x, y, z]} from the live go2
+        model. Mirrors MuJoCoArm.get_object_positions so the holding_object oracle +
+        the gripper's weld _try_grasp see the SAME duck-typed surface on the go2 path.
+        """
+        self._require_connection()
+        mj = _get_mujoco()
+        model = self._go2._mj.model
+        data = self._go2._mj.data
+        result: dict[str, list[float]] = {}
+        for i in range(model.nbody):
+            name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, i)
+            if name is None:
+                continue
+            jadr = int(model.body_jntadr[i])
+            if jadr < 0:
+                continue
+            if model.jnt_type[jadr] == mj.mjtJoint.mjJNT_FREE:
+                result[name] = list(data.body(name).xpos)
+        return result
+
     # ------------------------------------------------------------------
     # Motion
     # ------------------------------------------------------------------
@@ -313,6 +342,11 @@ class MuJoCoPiper:
         data = self._go2._mj.data
         start = [float(data.ctrl[aid]) for aid in self._arm_actuator_ids]
 
+        # R2b: the total commanded ctrl displacement (sum of |target - start| over
+        # the actuators). A no-op move_joints(current_pose) has zero magnitude, so
+        # it never satisfies the actor-causation grader.
+        commanded = sum(abs(float(g) - s) for s, g in zip(start, positions))
+
         steps = max(1, int(duration * _MOVE_UPDATE_HZ))
         dt = duration / steps
 
@@ -323,7 +357,23 @@ class MuJoCoPiper:
                     data.ctrl[aid] = s + t * (g - s)
             time.sleep(dt)
 
+        # Record the commanded motion ONCE (after the interpolation completes), so
+        # the grader sees the full step's commanded ctrl delta.
+        self._ctrl_writes += 1
+        self._ctrl_motion += commanded
         return True
+
+    def ctrl_motion(self) -> float:
+        """Cumulative commanded ctrl-displacement magnitude (R2b actor-causation).
+
+        The running sum of ``sum(|target - start|)`` over every ``move_joints``
+        call. The grader compares a baseline snapshot (before a step) with a post
+        snapshot (after) and treats a delta >= ``MOTION_EPS`` as "the actor
+        commanded arm motion". A move_joints to the current pose adds zero, so an
+        arm step that commanded nothing never reads as causation. Monotonically
+        non-decreasing.
+        """
+        return float(self._ctrl_motion)
 
     def move_cartesian(
         self,

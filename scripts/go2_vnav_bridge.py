@@ -72,6 +72,11 @@ from tf2_ros import TransformBroadcaster
 import numpy as np
 
 from vector_os_nano.hardware.sim.mujoco_go2 import MuJoCoGo2
+from vector_os_nano.hardware.sim.sim_clock import sim_tick_dt
+
+# Path-follower nominal tick. Single source: the _follow_path timer period AND
+# the per-tick ramp constants inside it are calibrated against this.
+_PF_DT = 1.0 / 20.0
 
 # ---------------------------------------------------------------------------
 # Nav config loader (lazy, module-level cache)
@@ -238,6 +243,16 @@ class Go2VNavBridge(Node):
         self._speed_pub = self.create_publisher(Float32, "/speed", 5)
         self._img_pub = self.create_publisher(Image, "/camera/image", reliable_qos)
         self._depth_pub = self.create_publisher(Image, "/camera/depth", reliable_qos)
+        # Real d435_rgb world pose (D36): the bridge owns the live MjData, so it
+        # is the single source of truth for the camera pose the depth pixels were
+        # rendered from. Published as a flat Float64MultiArray [xpos(3), xmat(9)]
+        # so Go2ROS2Proxy.get_camera_pose() can back-project /camera/depth with
+        # the EXACT pose (not a hand-approximated mount), which is what makes
+        # grasp_point_from_rgbd land on the object instead of high+far.
+        from std_msgs.msg import Float64MultiArray
+        self._cam_pose_pub = self.create_publisher(
+            Float64MultiArray, "/camera/pose", reliable_qos
+        )
 
         self._tf_broadcaster = TransformBroadcaster(self)
         # NOTE: static TF sensor→base_link is published by local_planner.launch.py
@@ -267,7 +282,7 @@ class Go2VNavBridge(Node):
         # Python path follower — primary. C++ pathFollower sends zeros between
         # TARE waypoints (pathSize<=1), so Python follower is needed to keep
         # the dog moving on stale paths until TARE replans.
-        self.create_timer(1.0 / 20.0, self._follow_path)
+        self.create_timer(_PF_DT, self._follow_path)
         # Camera rendering (5 Hz)
         self.create_timer(1.0 / 5.0, self._publish_camera)
         self._cmd_count = 0
@@ -291,10 +306,18 @@ class Go2VNavBridge(Node):
             PointStamped, "/reset_waypoint", 5
         )
 
-        # Wall escape state — two-phase: pure reverse then strafe+turn
-        self._wall_contact_time: float = 0.0    # seconds spent pinned (front_d<0.25 AND slow)
-        self._wall_escape_until: float = 0.0    # timestamp when escape maneuver ends
-        self._wall_escape_phase2: float = 0.0   # timestamp when phase 2 (strafe) starts
+        # Wall escape state — two-phase: pure reverse then strafe+turn.
+        # All in SIM time (like the ramps): the maneuver must travel the same
+        # plant distance at any sim/wall ratio, and freeze if the sim pauses.
+        self._wall_contact_time: float = 0.0     # sim-seconds pinned (front_d<0.30 AND slow)
+        self._wall_escape_elapsed: float = 0.0   # sim-seconds since escape trigger
+        self._wall_escape_total: float = 0.0     # escape duration (sim-s); elapsed>=total => inactive
+        self._wall_escape_phase2_at: float = 0.0 # sim-s offset where phase 2 (strafe) starts
+
+        # Sim-clock sample from the previous _follow_path tick (None until the
+        # first tick). All follower ramps integrate against sim-dt, not wall
+        # ticks — see _sim_tick_dt.
+        self._pf_last_sim_t: float | None = None
 
         # Scene graph visualization (1 Hz MarkerArray)
         self._scene_graph = None  # set externally by agent
@@ -562,6 +585,37 @@ class Go2VNavBridge(Node):
                 raise RuntimeError("piper gripper joint/actuator missing")
             self._piper_gripper_qpos_adr: int = int(model.jnt_qposadr[gjid])
             self._piper_gripper_act_id: int = int(gaid)
+
+            # EE site for the weld grasp (nearest-free-body pick). Mirrors
+            # MuJoCoPiperGripper: absent -> grasp degrades to a no-op (logged).
+            self._piper_ee_site_id: int = int(
+                mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "piper_ee_site")
+            )
+
+            # Cache pickable free-body names (for /piper/object_state) and the
+            # weld constraints (for grasp-on-close + per-weld active flags). A
+            # pickable is any body with a FREE joint; the welds are the MJCF
+            # GRASP_WELDS (piper_link6 -> pickable_*). Order is fixed so the
+            # proxy can decode the flat /piper/object_state array by index.
+            self._piper_pickable_names: list[str] = []
+            for bi in range(model.nbody):
+                bname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bi)
+                if bname is None:
+                    continue
+                jadr = int(model.body_jntadr[bi])
+                if jadr < 0:
+                    continue
+                if model.jnt_type[jadr] == mujoco.mjtJoint.mjJNT_FREE:
+                    self._piper_pickable_names.append(str(bname))
+            # Weld eqs: (eq_index, body2_name) for every WELD constraint.
+            self._piper_weld_eqs: list[tuple[int, str]] = []
+            for i in range(model.neq):
+                if model.eq_type[i] != mujoco.mjtEq.mjEQ_WELD:
+                    continue
+                b2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(model.eq_obj2id[i]))
+                if b2 is not None:
+                    self._piper_weld_eqs.append((int(i), str(b2)))
+            self._piper_grasp_radius: float = 0.06  # mirrors MuJoCoPiperGripper._GRASP_RADIUS
         except Exception as exc:
             self.get_logger().error(f"Piper bridge init failed: {exc}")
             return
@@ -573,6 +627,19 @@ class Go2VNavBridge(Node):
         self._piper_state_pub = self.create_publisher(
             JointState, "/piper/joint_state", 10
         )
+        # Additive object-state topic (D36): the bridge owns the live MjData, so
+        # it is the ONLY place that can publish real per-pickable world xpos +
+        # per-weld active to the main process. The proxies decode this so the
+        # verify oracle's get_object_positions()/weld_is_active()/is_holding()
+        # read REAL physics over ROS2. Layout (flat Float64MultiArray):
+        #   [N_obj, N_weld,
+        #    (x,y,z) * N_obj,            # pickable world positions, names order
+        #    active * N_weld]            # weld active flags (0/1), weld order
+        # Names are fixed by self._piper_pickable_names / self._piper_weld_eqs,
+        # shared with the proxy via the same MJCF body-discovery order.
+        self._piper_object_state_pub = self.create_publisher(
+            Float64MultiArray, "/piper/object_state", 10
+        )
         self.create_subscription(
             Float64MultiArray, "/piper/joint_cmd", self._piper_joint_cmd_cb, 10
         )
@@ -580,10 +647,14 @@ class Go2VNavBridge(Node):
             Float64, "/piper/gripper_cmd", self._piper_gripper_cmd_cb, 10
         )
         self.create_timer(1.0 / 20.0, self._publish_piper_state)  # 20 Hz
+        self.create_timer(1.0 / 20.0, self._publish_object_state)  # 20 Hz
 
         self._piper_enabled = True
         self.get_logger().info(
-            "Piper bridge: enabled (6 arm + 1 gripper joints, topics /piper/*)"
+            f"Piper bridge: enabled (6 arm + 1 gripper, "
+            f"{len(self._piper_pickable_names)} pickables, "
+            f"{len(self._piper_weld_eqs)} welds, ee_site={self._piper_ee_site_id}, "
+            f"topics /piper/*)"
         )
 
     def _piper_joint_cmd_cb(self, msg) -> None:
@@ -600,13 +671,23 @@ class Go2VNavBridge(Node):
             data.ctrl[aid] = float(msg.data[i])
 
     def _piper_gripper_cmd_cb(self, msg) -> None:
-        """Write gripper ctrl from /piper/gripper_cmd (0.0=closed, 1.0=open)."""
+        """Write gripper ctrl from /piper/gripper_cmd (0.0=closed, 1.0=open) and,
+        on a CLOSE command, activate the weld of the nearest pickable within
+        grasp range so the object physically attaches + lifts with the arm
+        (port of MuJoCoPiperGripper.close/_try_grasp). On OPEN, release welds.
+        The weld is what makes the verify oracle's holding_object grade GROUNDED.
+        """
         if not self._piper_enabled:
             return
         # Normalized 0..1 -> joint7 ctrl range 0..0.035
         x = float(msg.data)
         x = max(0.0, min(1.0, x))
         self._go2._mj.data.ctrl[self._piper_gripper_act_id] = x * 0.035
+        # cmd ~0 -> closing: try to grasp the nearest pickable. cmd ~open: release.
+        if x <= 0.01:
+            self._try_grasp()
+        else:
+            self._release_welds()
 
     def _publish_piper_state(self) -> None:
         """Publish /piper/joint_state at 20 Hz: 6 arm + 1 gripper positions."""
@@ -622,6 +703,114 @@ class Go2VNavBridge(Node):
         ]
         msg.position.append(float(data.qpos[self._piper_gripper_qpos_adr]))
         self._piper_state_pub.publish(msg)
+
+    # ------------------------------------------------------------------
+    # Weld-constraint grasping (port of MuJoCoPiperGripper, bridge-side)
+    # ------------------------------------------------------------------
+
+    def _try_grasp(self) -> None:
+        """Find the nearest free pickable within grasp range of the EE and
+        activate its weld (anchor pinned to the live relative pose so it does
+        not snap). The go2 runs a 1 kHz physics thread, so PAUSE it around the
+        eq_data/eq_active write to avoid racing a step, then resume to settle.
+        Mirrors MuJoCoPiperGripper._try_grasp exactly — the proven in-process
+        path — just reading the bridge's own (self._go2) MjData.
+        """
+        if self._piper_ee_site_id < 0:
+            return
+        import mujoco
+        model = self._go2._mj.model
+        data = self._go2._mj.data
+        pause = getattr(self._go2, "_pause_physics", None)
+        resume = getattr(self._go2, "_resume_physics", None)
+        try:
+            if pause:
+                pause()
+            try:
+                ee_pos = np.array(
+                    data.site_xpos[self._piper_ee_site_id], dtype=float
+                ).copy()
+                best_name, best_dist = None, self._piper_grasp_radius
+                for name in self._piper_pickable_names:
+                    d = float(np.linalg.norm(np.array(data.body(name).xpos) - ee_pos))
+                    if d < best_dist:
+                        best_dist, best_name = d, name
+                if best_name is None:
+                    # Log EE and all pickable positions for diagnosis
+                    pick_info = []
+                    for name in self._piper_pickable_names:
+                        bd = float(np.linalg.norm(np.array(data.body(name).xpos) - ee_pos))
+                        pick_info.append(f"{name}={np.array(data.body(name).xpos).round(3)} d={bd*1000:.0f}mm")
+                    self.get_logger().info(
+                        f"Piper grasp: no pickable within "
+                        f"{self._piper_grasp_radius * 1000:.0f}mm of EE "
+                        f"ee={ee_pos.round(3)} pickables=[{'; '.join(pick_info)}]"
+                    )
+                    return
+                for i, b2 in self._piper_weld_eqs:
+                    if b2 != best_name:
+                        continue
+                    b1 = int(model.eq_obj1id[i])
+                    b2id = int(model.eq_obj2id[i])
+                    p1 = data.xpos[b1]; R1 = data.xmat[b1].reshape(3, 3)
+                    p2 = data.xpos[b2id]; R2 = data.xmat[b2id].reshape(3, 3)
+                    rel_pos = R1.T @ (p2 - p1)
+                    rel_quat = np.zeros(4)
+                    mujoco.mju_mat2Quat(rel_quat, (R1.T @ R2).flatten())
+                    model.eq_data[i, :3] = 0.0
+                    model.eq_data[i, 3:6] = rel_pos
+                    model.eq_data[i, 6:10] = rel_quat
+                    data.eq_active[i] = 1
+                    self.get_logger().info(
+                        f"Piper grasp: welded '{best_name}' ({best_dist * 1000:.0f}mm)"
+                    )
+                    return
+                self.get_logger().warn(f"Piper grasp: no weld for '{best_name}'")
+            finally:
+                if resume:
+                    resume()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"Piper grasp failed: {exc}")
+
+    def _release_welds(self) -> None:
+        """Disable all weld constraints (release any held object)."""
+        data = self._go2._mj.data
+        pause = getattr(self._go2, "_pause_physics", None)
+        resume = getattr(self._go2, "_resume_physics", None)
+        try:
+            if pause:
+                pause()
+            try:
+                for i, _b2 in self._piper_weld_eqs:
+                    data.eq_active[i] = 0
+            finally:
+                if resume:
+                    resume()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _publish_object_state(self) -> None:
+        """Publish /piper/object_state at 20 Hz: real per-pickable world xpos +
+        per-weld active read from the live MjData (D36). This is the bridge's
+        honest report of the physics the main-process proxies cannot see, so
+        the verify oracle reads REAL object positions + grasp state over ROS2.
+        Flat layout: [N_obj, N_weld, x,y,z per obj..., active per weld...].
+        """
+        if not self._piper_enabled:
+            return
+        from std_msgs.msg import Float64MultiArray
+        data = self._go2._mj.data
+        n_obj = len(self._piper_pickable_names)
+        n_weld = len(self._piper_weld_eqs)
+        out: list[float] = [float(n_obj), float(n_weld)]
+        for name in self._piper_pickable_names:
+            xpos = data.body(name).xpos
+            out.extend([float(xpos[0]), float(xpos[1]), float(xpos[2])])
+        for i, _b2 in self._piper_weld_eqs:
+            out.append(1.0 if int(data.eq_active[i]) != 0 else 0.0)
+        msg = Float64MultiArray()
+        msg.data = out
+        self._piper_object_state_pub.publish(msg)
 
     def _cmd_vel_cb(self, msg: Twist) -> None:
         self._go2.set_velocity(msg.linear.x, msg.linear.y, msg.angular.z)
@@ -776,49 +965,31 @@ class Go2VNavBridge(Node):
         self._speed_pub.publish(speed)
 
     def _publish_camera(self) -> None:
-        """Render first-person camera from Go2 head (free camera).
+        """Render first-person RGB+depth from the d435_rgb/d435_depth named cameras.
 
-        Uses a free camera positioned at the sensor mount looking forward.
-        The named d435_rgb camera produces a rotated image in this context,
-        so we keep the manually positioned free camera for ROS /camera/image.
-
-        NOTE: The VLM pipeline (get_camera_frame) uses the named d435
-        camera directly in mujoco_go2.py — that is separate from this bridge
-        camera and produces correct images for VLM scene description.
+        Delegates to MuJoCoGo2.get_camera_frame / get_depth_frame which use the
+        exact MJCF-defined d435 camera pose — the same pose returned by
+        get_camera_pose(). This ensures the depth pixels align with cam_xpos/xmat
+        used in grasp_point_from_rgbd for correct 3D reconstruction.
         """
         try:
-            import mujoco
-            if not hasattr(self, '_renderer'):
-                self._renderer = mujoco.Renderer(
-                    self._go2._mj.model, 240, 320
-                )
-                self._cam = mujoco.MjvCamera()
-                self._cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-
-            model = self._go2._mj.model
-            data = self._go2._mj.data
-
-            odom = self._go2.get_odometry()
-            heading = self._go2.get_heading()
-            cos_h = math.cos(heading)
-            sin_h = math.sin(heading)
-
-            cam_x = odom.x + cos_h * (_SENSOR_X + 0.1)
-            cam_y = odom.y + sin_h * (_SENSOR_X + 0.1)
-            cam_z = odom.z + _SENSOR_Z - 0.04
-
-            self._cam.lookat[:] = [
-                cam_x + cos_h * 1.0,
-                cam_y + sin_h * 1.0,
-                cam_z - 0.1,
-            ]
-            self._cam.distance = 1.0
-            self._cam.azimuth = math.degrees(heading) + 180
-            self._cam.elevation = -10
-
-            self._renderer.update_scene(data, camera=self._cam)
-            rgb = self._renderer.render().copy()
+            rgb = self._go2.get_camera_frame(320, 240)
             now = self.get_clock().now().to_msg()
+
+            # Publish the REAL d435_rgb world pose alongside the image it was
+            # rendered from (D36). cam_xpos/cam_xmat are kept current by the
+            # bridge's continuous physics stepping (mj_step updates them), so a
+            # plain read here is live. Flat [xpos(3), xmat(9)].
+            try:
+                cam_xpos, cam_xmat = self._go2.get_camera_pose()
+                from std_msgs.msg import Float64MultiArray
+                pose_msg = Float64MultiArray()
+                pose_msg.data = [float(v) for v in cam_xpos] + [
+                    float(v) for v in cam_xmat
+                ]
+                self._cam_pose_pub.publish(pose_msg)
+            except Exception:
+                pass
 
             img_msg = Image()
             img_msg.header.stamp = now
@@ -830,32 +1001,20 @@ class Go2VNavBridge(Node):
             img_msg.data = bytes(rgb)
             self._img_pub.publish(img_msg)
 
-            # Depth via separate renderer
-            if not hasattr(self, '_depth_renderer'):
-                try:
-                    self._depth_renderer = mujoco.Renderer(
-                        self._go2._mj.model, 240, 320
-                    )
-                    self._depth_renderer.enable_depth_rendering()
-                except Exception:
-                    self._depth_renderer = None
+            try:
+                depth = self._go2.get_depth_frame(320, 240)
 
-            if self._depth_renderer is not None:
-                try:
-                    self._depth_renderer.update_scene(data, camera=self._cam)
-                    depth = self._depth_renderer.render().copy()
-
-                    depth_msg = Image()
-                    depth_msg.header.stamp = now
-                    depth_msg.header.frame_id = "camera_link"
-                    depth_msg.height = 240
-                    depth_msg.width = 320
-                    depth_msg.encoding = "32FC1"
-                    depth_msg.step = 320 * 4
-                    depth_msg.data = bytes(depth.astype(np.float32))
-                    self._depth_pub.publish(depth_msg)
-                except Exception:
-                    pass
+                depth_msg = Image()
+                depth_msg.header.stamp = now
+                depth_msg.header.frame_id = "camera_link"
+                depth_msg.height = 240
+                depth_msg.width = 320
+                depth_msg.encoding = "32FC1"
+                depth_msg.step = 320 * 4
+                depth_msg.data = bytes(depth.astype(np.float32))
+                self._depth_pub.publish(depth_msg)
+            except Exception:
+                pass
         except Exception as e:
             if not hasattr(self, '_cam_err_logged'):
                 self.get_logger().warn(f"Camera render failed: {e}")
@@ -1035,15 +1194,48 @@ class Go2VNavBridge(Node):
 
         return (front_min, left_min, right_min, back_min)
 
+    def _sim_tick_dt(self) -> float:
+        """Sim-time elapsed since the previous follower tick (seconds).
+
+        The physics daemon often runs below wall speed (compute-bound: ~0.65x
+        measured with GUI + RViz), while this follower ticks on a WALL-clock
+        20 Hz timer. Velocity ramps integrated per wall tick then slew ~1/0.65x
+        faster in the gait's own (sim) time than they were tuned for and
+        destabilize the MPC gait ("飘/瘸腿"). Every ramp/accumulator in
+        _follow_path therefore integrates against THIS dt. Falls back to the
+        nominal tick when no sim clock is readable (real hardware, error), so
+        the pre-fix behavior is the degraded mode, never an exception.
+        """
+        now_sim: float | None = None
+        get_t = getattr(self._go2, "get_sim_time", None)
+        if get_t is not None:
+            try:
+                now_sim = float(get_t())
+            except Exception:
+                now_sim = None
+        last = self._pf_last_sim_t
+        self._pf_last_sim_t = now_sim
+        return sim_tick_dt(now_sim, last, _PF_DT)
+
     def _follow_path(self) -> None:
-        """Omnidirectional quadruped path follower (20 Hz).
+        """Omnidirectional quadruped path follower (20 Hz wall timer).
 
         Go2 can walk forward, backward, and sideways. This follower:
         1. ALWAYS prefers forward motion (vx > 0)
         2. Uses lateral velocity (vy) to track path when direction error is large
         3. Reverses ONLY when target is directly behind AND very close (dead end)
         4. Applies reactive wall avoidance overlay from cached pointcloud
+
+        All ramps/accumulators integrate against sim-dt (see _sim_tick_dt):
+        per-tick constants below are calibrated for a nominal _PF_DT tick and
+        scaled by `tick` = actual sim-ticks' worth of time elapsed.
         """
+        # Sample the sim clock BEFORE any early return so it stays fresh
+        # across teleop/skill-gated ticks (no stale-dt jump on resume).
+        dt_sim = self._sim_tick_dt()
+        tick = dt_sim / _PF_DT   # nominal-ticks' worth of sim time elapsed
+        decay = 0.9 ** tick      # per-tick 0.9 decel-to-stop decay, dt-corrected
+
         if time.time() < self._teleop_until:
             return
         # Skill-level override: walk/turn/etc. acquires exclusive control via
@@ -1058,7 +1250,8 @@ class Go2VNavBridge(Node):
         # Lidar is mounted -20° tilt on head (0.3m forward) — rear coverage
         # is sparser, so back_d uses a conservative clearance threshold.
         now = time.time()
-        if now < self._wall_escape_until:
+        if self._wall_escape_elapsed < self._wall_escape_total:
+            self._wall_escape_elapsed += dt_sim  # sim-time maneuver progress
             front_d, left_d, right_d, back_d = self._scan_surroundings()
             # Lidar rear coverage is sparse due to -20° tilt — treat back_d
             # as less reliable. Use conservative threshold (0.40m) vs front (0.30m).
@@ -1066,7 +1259,7 @@ class Go2VNavBridge(Node):
             left_clear = left_d > 0.25
             right_clear = right_d > 0.25
 
-            if now < self._wall_escape_phase2:
+            if self._wall_escape_elapsed < self._wall_escape_phase2_at:
                 # Phase 1: try to reverse — but only if back is clear
                 if back_clear:
                     tgt_vx, tgt_vy, tgt_yaw = -0.35, 0.0, 0.0
@@ -1089,14 +1282,14 @@ class Go2VNavBridge(Node):
                     tgt_yaw = 0.4 if left_d > right_d else -0.4
                 tgt_vx = -0.10 if back_clear else 0.0
 
-            # Moderate ramp — responsive but not violent
-            _A = 0.04
+            # Moderate ramp — responsive but not violent (per-tick, dt-scaled)
+            _A = 0.04 * tick
             if self._pf_speed < tgt_vx: self._pf_speed = min(tgt_vx, self._pf_speed + _A)
             else: self._pf_speed = max(tgt_vx, self._pf_speed - _A)
-            if self._pf_lat < tgt_vy: self._pf_lat = min(tgt_vy, self._pf_lat + 0.03)
-            else: self._pf_lat = max(tgt_vy, self._pf_lat - 0.03)
-            if self._pf_yawrate < tgt_yaw: self._pf_yawrate = min(tgt_yaw, self._pf_yawrate + 0.06)
-            else: self._pf_yawrate = max(tgt_yaw, self._pf_yawrate - 0.06)
+            if self._pf_lat < tgt_vy: self._pf_lat = min(tgt_vy, self._pf_lat + 0.03 * tick)
+            else: self._pf_lat = max(tgt_vy, self._pf_lat - 0.03 * tick)
+            if self._pf_yawrate < tgt_yaw: self._pf_yawrate = min(tgt_yaw, self._pf_yawrate + 0.06 * tick)
+            else: self._pf_yawrate = max(tgt_yaw, self._pf_yawrate - 0.06 * tick)
             self._go2.set_velocity(self._pf_speed, self._pf_lat, self._pf_yawrate)
             self._last_cmd_time = now
             return
@@ -1105,7 +1298,7 @@ class Go2VNavBridge(Node):
         front_d_check = self._check_front_obstacle()
         cur_speed = self._pf_speed if hasattr(self, '_pf_speed') else 0.0
         if front_d_check < 0.30 and cur_speed < 0.15:
-            self._wall_contact_time += 1.0 / 20.0  # 20 Hz tick
+            self._wall_contact_time += dt_sim  # sim-seconds pinned (was wall tick)
         else:
             self._wall_contact_time = 0.0
 
@@ -1116,18 +1309,19 @@ class Go2VNavBridge(Node):
                 f"R={right_d:.2f} B={back_d:.2f}"
             )
             all_tight = front_d < 0.35 and left_d < 0.30 and right_d < 0.30
+            self._wall_escape_elapsed = 0.0
             if all_tight and back_d > 0.40:
                 # Boxed in with only rear open — sustained reverse
-                self._wall_escape_phase2 = now + 3.0
-                self._wall_escape_until = now + 3.0
+                self._wall_escape_phase2_at = 3.0
+                self._wall_escape_total = 3.0
             elif back_d > 0.40:
                 # Front blocked, back clear — reverse then strafe
-                self._wall_escape_phase2 = now + 0.8
-                self._wall_escape_until = now + 2.5
+                self._wall_escape_phase2_at = 0.8
+                self._wall_escape_total = 2.5
             else:
                 # Front AND back blocked — turn in place to find opening
-                self._wall_escape_phase2 = now  # skip reverse, go straight to strafe/turn
-                self._wall_escape_until = now + 2.0
+                self._wall_escape_phase2_at = 0.0  # skip reverse, straight to strafe/turn
+                self._wall_escape_total = 2.0
             self._wall_contact_time = 0.0
             self._current_path = []
             self._stuck_count = 0
@@ -1153,14 +1347,14 @@ class Go2VNavBridge(Node):
         _LOOK_AHEAD = 0.8              # m lookahead
         _STOP_DIS = 0.2                # m — stop within this
         _SLOW_DWN_DIS = 1.0            # m — start decelerating
-        _ACCEL = 0.03                  # m/s per step @ 20Hz (0→0.8 takes 1.3s)
+        _ACCEL = 0.03                  # m/s per nominal tick (sim-dt-scaled below)
         _PATH_TIMEOUT = 8.0            # seconds before path considered stale
 
         # Stop immediately if exploration is done
         if self._exploration_finished:
-            self._pf_speed *= 0.9
-            self._pf_lat *= 0.9
-            self._pf_yawrate *= 0.9
+            self._pf_speed *= decay
+            self._pf_lat *= decay
+            self._pf_yawrate *= decay
             if abs(self._pf_speed) < 0.01: self._pf_speed = 0.0
             if abs(self._pf_lat) < 0.01: self._pf_lat = 0.0
             if abs(self._pf_yawrate) < 0.01: self._pf_yawrate = 0.0
@@ -1173,9 +1367,9 @@ class Go2VNavBridge(Node):
         if not has_path:
             if not self._nav_enabled:
                 # Decel to stop (smoothed)
-                self._pf_speed *= 0.9
-                self._pf_lat *= 0.9
-                self._pf_yawrate *= 0.9
+                self._pf_speed *= decay
+                self._pf_lat *= decay
+                self._pf_yawrate *= decay
                 if abs(self._pf_speed) < 0.01: self._pf_speed = 0.0
                 if abs(self._pf_lat) < 0.01: self._pf_lat = 0.0
                 if abs(self._pf_yawrate) < 0.01: self._pf_yawrate = 0.0
@@ -1187,12 +1381,12 @@ class Go2VNavBridge(Node):
                     tgt_vx, tgt_yaw = 0.0, 0.3    # stop, turn to find new path
                 else:
                     tgt_vx, tgt_yaw = 0.05, 0.0   # gentle creep (was 0.15 — too aggressive)
-                _A = 0.03
+                _A = 0.03 * tick
                 if self._pf_speed < tgt_vx: self._pf_speed = min(tgt_vx, self._pf_speed + _A)
                 else: self._pf_speed = max(tgt_vx, self._pf_speed - _A)
-                if self._pf_yawrate < tgt_yaw: self._pf_yawrate = min(tgt_yaw, self._pf_yawrate + 0.03)
-                else: self._pf_yawrate = max(tgt_yaw, self._pf_yawrate - 0.03)
-                self._pf_lat *= 0.9  # decay lateral
+                if self._pf_yawrate < tgt_yaw: self._pf_yawrate = min(tgt_yaw, self._pf_yawrate + 0.03 * tick)
+                else: self._pf_yawrate = max(tgt_yaw, self._pf_yawrate - 0.03 * tick)
+                self._pf_lat *= decay  # decay lateral
             self._go2.set_velocity(self._pf_speed, self._pf_lat, self._pf_yawrate)
             self._last_cmd_time = time.time()
             self._pf_point_id = 0
@@ -1357,15 +1551,19 @@ class Go2VNavBridge(Node):
                 vy = 0.0
 
         # --- Smooth acceleration (prevents MPC gait destabilization) ---
-        _ACCEL_LAT = 0.01    # m/s per tick lateral (0→0.15 takes 0.75s)
-        _ACCEL_YAW_TRACK = 0.04   # rad/s per tick in tracking (gentle)
-        _ACCEL_YAW_TURN = 0.08    # rad/s per tick in turn mode (faster)
+        # Per-nominal-tick rates, integrated against sim time via `tick` so
+        # the profile the gait sees matches the tuned design at any sim/wall
+        # ratio (the un-scaled ramp at 0.65x sim speed was the "飘/瘸腿" bug).
+        _ACCEL_FWD = _ACCEL * tick       # m/s this tick forward
+        _ACCEL_LAT = 0.01 * tick    # m/s per tick lateral (0→0.15 takes 0.75s sim)
+        _ACCEL_YAW_TRACK = 0.04 * tick   # rad/s per tick in tracking (gentle)
+        _ACCEL_YAW_TURN = 0.08 * tick    # rad/s per tick in turn mode (faster)
 
         # Forward/reverse
         if self._pf_speed < vx:
-            self._pf_speed = min(vx, self._pf_speed + _ACCEL)
+            self._pf_speed = min(vx, self._pf_speed + _ACCEL_FWD)
         elif self._pf_speed > vx:
-            self._pf_speed = max(vx, self._pf_speed - _ACCEL * 2)  # decel 2x faster
+            self._pf_speed = max(vx, self._pf_speed - _ACCEL_FWD * 2)  # decel 2x faster
 
         # Lateral
         target_lat = float(np.clip(vy, -_MAX_LAT, _MAX_LAT))
@@ -1499,18 +1697,19 @@ class Go2VNavBridge(Node):
                 all_tight = front_d < 0.35 and left_d < 0.30 and right_d < 0.30
                 # Conservative rear threshold — lidar rear coverage sparse at -20° tilt
                 back_clear = back_d > 0.40
+                self._wall_escape_elapsed = 0.0
                 if all_tight and back_clear:
                     # Boxed in — sustained reverse
-                    self._wall_escape_phase2 = now + 4.0
-                    self._wall_escape_until = now + 4.0
+                    self._wall_escape_phase2_at = 4.0
+                    self._wall_escape_total = 4.0
                 elif back_clear:
                     # Front blocked, back clear — reverse then strafe
-                    self._wall_escape_phase2 = now + 0.8
-                    self._wall_escape_until = now + _escape_dur
+                    self._wall_escape_phase2_at = 0.8
+                    self._wall_escape_total = _escape_dur
                 else:
                     # Front AND back blocked — turn in place
-                    self._wall_escape_phase2 = now
-                    self._wall_escape_until = now + _escape_dur
+                    self._wall_escape_phase2_at = 0.0
+                    self._wall_escape_total = _escape_dur
                 self._current_path = []
                 self._stuck_count = 0
                 self._stuck_wall_clock = 0.0
@@ -1526,8 +1725,9 @@ class Go2VNavBridge(Node):
                         for p in recent
                     ):
                         self.get_logger().warn("Stuck loop — extended escape 4s")
-                        self._wall_escape_phase2 = now + 2.0
-                        self._wall_escape_until = now + 4.0
+                        self._wall_escape_elapsed = 0.0
+                        self._wall_escape_phase2_at = 2.0
+                        self._wall_escape_total = 4.0
                         self._stuck_history.clear()
 
         self._stuck_pos = cur
