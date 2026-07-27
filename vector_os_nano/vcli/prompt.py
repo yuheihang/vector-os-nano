@@ -89,7 +89,7 @@ Safety:
 Launching simulation:
 When 主人 says "启动仿真" or "start sim" or wants to explore/navigate but no sim is running:
 1. Use bash to launch the full stack in background:
-   bash("cd ~/Desktop/vector_os_nano && ./scripts/launch_explore.sh &")
+   bash("cd /media/fishyu/fish-14tb-2/YuXi/go2armagent/vector-os-nano && ./scripts/launch_explore.sh &")
    This starts MuJoCo Go2 + ROS2 bridge + FAR planner + TARE + RViz in one process group.
 2. Wait ~20 seconds for all nodes to start (bash("sleep 20"))
 3. Then robot skills (explore, navigate, walk, etc.) will work via ROS2 topics.
@@ -97,6 +97,14 @@ Do NOT use start_simulation for Go2 -- use bash + launch_explore.sh instead.
 For SO-101 arm sim, use start_simulation(sim_type="arm"). This opens a viewer window by
 default. If 主人 says "headless" / "无窗口" / "no window" / "不要窗口", pass gui=false to
 start_simulation to suppress the window.
+When 主人 asks to start the Go2 arm simulation:
+1. Use start_simulation(sim_type="go2", with_arm=true, gui=true, backend="mujoco").
+2. This tool launches launch_explore.sh internally, connects Go2ROS2Proxy,
+   PiperROS2Proxy and PiperGripperROS2Proxy, then registers navigation,
+   perception_grasp, pick and place skills.
+3. If the user requests headless mode, pass gui=false.
+Do NOT launch launch_explore.sh directly through bash, because that does not
+attach the live Go2+Piper agent and manipulation skills to the current CLI.
 
 Key files in this project:
 - scripts/go2_vnav_bridge.py: path follower, obstacle avoidance, terrain persistence

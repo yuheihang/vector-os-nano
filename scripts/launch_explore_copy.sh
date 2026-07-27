@@ -2,7 +2,7 @@
 # Go2 + Vector Nav Stack + TARE Autonomous Exploration — one-command launch
 #
 # Usage:
-#   cd /media/fishyu/fish-14tb-2/YuXi/go2armagent/vector-os-nano
+#   cd ~/Desktop/vector_os_nano
 #   ./scripts/launch_explore.sh              # MuJoCo viewer + RViz
 #   ./scripts/launch_explore.sh --no-gui     # headless MuJoCo
 #
@@ -15,11 +15,7 @@ set -m
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-
-# Main project directories
-GO2ARM_ROOT="${GO2ARM_ROOT:-/media/fishyu/fish-14tb-2/YuXi/go2armagent}"
-NAV_STACK="${NAV_STACK:-$GO2ARM_ROOT/vector_navigation_stack}"
-TARE_ROOT="${TARE_ROOT:-$GO2ARM_ROOT/third_party/tare_planner}"
+NAV_STACK="/home/yusen/Desktop/vector_navigation_stack"
 
 NO_GUI=""
 for arg in "$@"; do
@@ -30,17 +26,15 @@ done
 export VECTOR_VLM_URL="${VECTOR_VLM_URL:-http://localhost:11434/v1}"
 export VECTOR_VLM_MODEL="${VECTOR_VLM_MODEL:-gemma4:e4b}"
 
-# Python packages such as convex_mpc are installed in the active Conda
-# environment, so only add this repository itself to PYTHONPATH.
-export PYTHONPATH="$REPO_DIR:${PYTHONPATH:-}"
-
-# TARE uses its bundled OR-Tools shared libraries.
-export LD_LIBRARY_PATH="$TARE_ROOT/src/tare_planner/or-tools/lib:${LD_LIBRARY_PATH:-}"
-
+# Repo venv site-packages (uv-managed .venv; falls back to legacy .venv-nano)
+VENV_SP="$REPO_DIR/.venv/lib/python3.12/site-packages"
+[ -d "$VENV_SP" ] || VENV_SP="$REPO_DIR/.venv-nano/lib/python3.12/site-packages"
+CMEEL_SP="$VENV_SP/cmeel.prefix/lib/python3.12/site-packages"
+CONVEX_SRC="/home/yusen/Desktop/go2-convex-mpc/src"
+export PYTHONPATH="$VENV_SP:$CMEEL_SP:$CONVEX_SRC:$REPO_DIR:$PYTHONPATH"
 export ROBOT_CONFIG_PATH="unitree/unitree_go2"
 
-# ROS 2 Humble and the compiled navigation workspace
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 source "$NAV_STACK/install/setup.bash"
 
 PIDS=()
@@ -86,7 +80,7 @@ sleep 7
 
 # 2. Local planner stack
 echo "[2/8] Starting local planner..."
-ros2 launch local_planner local_planner.launch \
+ros2 launch local_planner local_planner.launch.py \
     robot_config:=unitree/unitree_go2 \
     autonomyMode:=true \
     joyToSpeedDelay:=0.0 \
@@ -120,23 +114,8 @@ PIDS+=($!)
 sleep 3
 
 # 5. FAR Planner (routes to TARE waypoints)
-# Deploy the Go2-tuned FAR configuration before launching FAR.
-FAR_CONFIG_DIR="$NAV_STACK/install/far_planner/share/far_planner/config"
-
-if [ ! -d "$FAR_CONFIG_DIR" ]; then
-    echo "ERROR: FAR config directory not found:"
-    echo "  $FAR_CONFIG_DIR"
-    echo "Build vector_navigation_stack first."
-    exit 1
-fi
-
-cp "$REPO_DIR/config/far_go2_indoor.yaml" \
-   "$FAR_CONFIG_DIR/indoor.yaml"
-
 echo "[5/8] Starting FAR planner..."
-ros2 launch far_planner far_planner.launch.py \
-    config:=indoor \
-    rviz:=false &
+ros2 launch far_planner far_planner.launch config:=indoor &
 PIDS+=($!)
 sleep 3
 
@@ -145,24 +124,16 @@ sleep 3
 cp "$REPO_DIR/config/tare_go2_indoor.yaml" \
    "$NAV_STACK/install/tare_planner/share/tare_planner/indoor_small.yaml" 2>/dev/null
 echo "[6/7] Starting TARE exploration planner..."
-ros2 launch tare_planner explore.launch.py \
-    scenario:=indoor_small \
-    rviz:=false &
+ros2 launch tare_planner explore.launch scenario:=indoor_small &
 PIDS+=($!)
 sleep 2
 
-# 7. Visualization + optional RViz
-echo "[7/7] Starting visualization tools..."
+# 7. Visualization + RViz
+echo "[7/7] Starting visualization + RViz..."
 ros2 run visualization_tools visualizationTools 2>/dev/null &
 PIDS+=($!)
-
-if [ -z "$NO_GUI" ]; then
-    echo "Starting RViz with: $RVIZ_CFG"
-    rviz2 -d "$RVIZ_CFG" &
-    PIDS+=($!)
-else
-    echo "Headless mode: RViz disabled."
-fi
+rviz2 -d "$RVIZ_CFG" 2>/dev/null &
+PIDS+=($!)
 
 # No seed movement, no nav flag. Dog stays still until user gives a command.
 # TARE has kAutoStart=false — waits for /start_exploration from ExploreSkill.

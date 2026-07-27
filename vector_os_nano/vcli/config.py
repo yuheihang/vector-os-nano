@@ -187,6 +187,8 @@ def resolve_credentials(
 
     if api_key:
         provider = "anthropic"
+        if not base_url:
+            base_url = os.environ.get("ANTHROPIC_BASE_URL") or None
     else:
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:

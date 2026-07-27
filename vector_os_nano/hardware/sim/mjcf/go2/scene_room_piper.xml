@@ -1,6 +1,6 @@
 <mujoco model="go2 house">
-  <compiler angle="radian" meshdir="/home/yusen/Desktop/vector_os_nano/vector_os_nano/hardware/sim/mjcf/go2/assets" texturedir="/home/yusen/Desktop/vector_os_nano/vector_os_nano/hardware/sim/mjcf/go2/assets" autolimits="true"/>
-  <include file="/home/yusen/Desktop/vector_os_nano/vector_os_nano/hardware/sim/mjcf/go2_piper/go2_piper.xml"/>
+  <compiler angle="radian" meshdir="/media/fishyu/fish-14tb-2/YuXi/go2armagent/vector-os-nano/vector_os_nano/hardware/sim/mjcf/go2/assets" texturedir="/media/fishyu/fish-14tb-2/YuXi/go2armagent/vector-os-nano/vector_os_nano/hardware/sim/mjcf/go2/assets" autolimits="true"/>
+  <include file="/media/fishyu/fish-14tb-2/YuXi/go2armagent/vector-os-nano/vector_os_nano/hardware/sim/mjcf/go2_piper/go2_piper.xml"/>
 
   <option cone="elliptic" impratio="100"/>
 

@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,11 +47,15 @@ class EdgeTAMTracker:
 
     def __init__(
         self,
-        model_name: str = DEFAULT_EDGETAM_REPO,
+        model_name: Optional[str] = None,
         device: Optional[str] = None,
         buffer_size: int = 5,
     ) -> None:
-        self._model_name = model_name
+        self._model_name = (
+        model_name
+        or os.environ.get("EDGETAM_MODEL_PATH")
+        or DEFAULT_EDGETAM_REPO
+        )
         self._device_str = device
         self._buffer_size = max(1, int(buffer_size))
 
