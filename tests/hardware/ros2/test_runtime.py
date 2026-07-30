@@ -10,7 +10,7 @@ the module-level _runtime variable in teardown.
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -30,6 +30,20 @@ def _make_fake_rclpy() -> tuple[MagicMock, MagicMock]:
     """
     fake_rclpy = MagicMock(name="rclpy")
     fake_rclpy.ok.return_value = True  # rclpy already initialised — default path
+    fake_context = MagicMock(name="rclpy_default_context")
+    fake_context.get_domain_id.return_value = 0
+    fake_rclpy.get_default_context.return_value = fake_context
+
+    def _init(*, domain_id=None, **_kwargs):
+        fake_rclpy.ok.return_value = True
+        if domain_id is not None:
+            fake_context.get_domain_id.return_value = int(domain_id)
+
+    def _shutdown(**_kwargs):
+        fake_rclpy.ok.return_value = False
+
+    fake_rclpy.init.side_effect = _init
+    fake_rclpy.shutdown.side_effect = _shutdown
 
     fake_executors_mod = MagicMock(name="rclpy.executors")
 
@@ -55,6 +69,7 @@ def _make_fake_rclpy() -> tuple[MagicMock, MagicMock]:
 def reset_singleton(monkeypatch):
     """Reset the module-level _runtime to None between tests and inject fake rclpy."""
     fake_rclpy, fake_executor_cls, executor_instance = _make_fake_rclpy()
+    monkeypatch.delenv("ROS_DOMAIN_ID", raising=False)
 
     # Inject before importing the module under test
     monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
@@ -227,3 +242,127 @@ def test_ros2_runtime_shutdown_joins_thread(reset_singleton):
     )
     # is_running must be False after shutdown
     assert runtime.is_running is False
+
+
+def test_shutdown_if_idle_preserves_other_nodes_then_drains(reset_singleton):
+    rt_mod = reset_singleton["rt_mod"]
+    executor_instance = reset_singleton["executor_instance"]
+    runtime = rt_mod.get_ros2_runtime()
+    node = MagicMock(name="live_node")
+
+    runtime.add_node(node)
+    assert runtime.shutdown_if_idle() is False
+    executor_instance.shutdown.assert_not_called()
+
+    runtime.remove_node(node)
+    assert runtime.shutdown_if_idle() is True
+    executor_instance.shutdown.assert_called_once()
+    assert runtime.is_running is False
+
+
+def test_prepare_for_domain_restarts_idle_owned_context(reset_singleton, monkeypatch):
+    """A new session may replace an idle runtime-owned context and DDS domain."""
+    rt_mod = reset_singleton["rt_mod"]
+    fake_rclpy = reset_singleton["fake_rclpy"]
+    fake_rclpy.ok.return_value = False
+    runtime = rt_mod.get_ros2_runtime()
+
+    monkeypatch.setenv("ROS_DOMAIN_ID", "41")
+    assert runtime.prepare_for_domain(41) == 41
+    assert runtime.domain_id == 41
+
+    monkeypatch.setenv("ROS_DOMAIN_ID", "42")
+    assert runtime.prepare_for_domain(42) == 42
+    assert runtime.domain_id == 42
+
+    assert fake_rclpy.init.call_args_list == [
+        call(domain_id=41),
+        call(domain_id=42),
+    ]
+    fake_rclpy.shutdown.assert_called_once()
+
+
+def test_shutdown_if_idle_allows_stop_then_start_on_new_domain(
+    reset_singleton,
+    monkeypatch,
+):
+    """Final-node teardown releases the context before the next session."""
+    rt_mod = reset_singleton["rt_mod"]
+    fake_rclpy = reset_singleton["fake_rclpy"]
+    fake_rclpy.ok.return_value = False
+    runtime = rt_mod.get_ros2_runtime()
+    node = MagicMock(name="session_node")
+
+    monkeypatch.setenv("ROS_DOMAIN_ID", "51")
+    runtime.prepare_for_domain(51)
+    runtime.add_node(node)
+    runtime.remove_node(node)
+    assert runtime.shutdown_if_idle() is True
+    assert fake_rclpy.ok() is False
+    assert runtime.domain_id is None
+
+    monkeypatch.setenv("ROS_DOMAIN_ID", "52")
+    runtime.prepare_for_domain(52)
+    assert runtime.domain_id == 52
+    assert fake_rclpy.init.call_args_list == [
+        call(domain_id=51),
+        call(domain_id=52),
+    ]
+
+
+def test_prepare_for_domain_borrows_matching_external_context(
+    reset_singleton,
+    monkeypatch,
+):
+    """A verified same-domain external context is borrowed, never shut down."""
+    rt_mod = reset_singleton["rt_mod"]
+    fake_rclpy = reset_singleton["fake_rclpy"]
+    fake_rclpy.ok.return_value = True
+    fake_rclpy.get_default_context().get_domain_id.return_value = 61
+    monkeypatch.setenv("ROS_DOMAIN_ID", "61")
+    runtime = rt_mod.get_ros2_runtime()
+
+    assert runtime.prepare_for_domain(61) == 61
+    assert runtime.domain_id == 61
+    fake_rclpy.init.assert_not_called()
+
+    assert runtime.shutdown_if_idle() is True
+    fake_rclpy.shutdown.assert_not_called()
+    assert fake_rclpy.ok() is True
+
+
+def test_prepare_for_domain_rejects_mismatched_external_context(
+    reset_singleton,
+    monkeypatch,
+):
+    """An external context on an old domain must not be silently reused."""
+    rt_mod = reset_singleton["rt_mod"]
+    fake_rclpy = reset_singleton["fake_rclpy"]
+    fake_rclpy.ok.return_value = True
+    fake_rclpy.get_default_context().get_domain_id.return_value = 71
+    monkeypatch.setenv("ROS_DOMAIN_ID", "72")
+    runtime = rt_mod.get_ros2_runtime()
+
+    with pytest.raises(RuntimeError, match=r"externally initialised.*71.*72"):
+        runtime.prepare_for_domain(72)
+
+    fake_rclpy.init.assert_not_called()
+    fake_rclpy.shutdown.assert_not_called()
+
+
+def test_prepare_for_domain_rejects_switch_while_nodes_active(
+    reset_singleton,
+    monkeypatch,
+):
+    rt_mod = reset_singleton["rt_mod"]
+    fake_rclpy = reset_singleton["fake_rclpy"]
+    fake_rclpy.ok.return_value = False
+    runtime = rt_mod.get_ros2_runtime()
+
+    monkeypatch.setenv("ROS_DOMAIN_ID", "81")
+    runtime.prepare_for_domain(81)
+    runtime.add_node(MagicMock(name="active_node"))
+
+    monkeypatch.setenv("ROS_DOMAIN_ID", "82")
+    with pytest.raises(RuntimeError, match=r"nodes are active.*81.*82"):
+        runtime.prepare_for_domain(82)

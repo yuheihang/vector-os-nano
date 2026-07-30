@@ -11,6 +11,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from vector_os_nano.navigation.runtime_files import (
+    nav_active_file,
+    nav_replay_file,
+    terrain_map_file,
+)
 from vector_os_nano.vcli.tools.base import ToolContext, ToolResult, tool
 
 
@@ -78,7 +83,7 @@ class NavStateTool:
         data: dict[str, Any] = {
             "exploring": _is_exploring(),
             "nav_stack_running": _is_nav_stack_running(),
-            "nav_flag_active": os.path.exists("/tmp/vector_nav_active"),
+            "nav_flag_active": os.path.exists(nav_active_file()),
             "explored_rooms": _get_explored_rooms(),
             "tare_running": _is_process_running("tare_planner_node"),
             "far_running": _is_process_running("far_planner"),
@@ -92,9 +97,6 @@ class NavStateTool:
 # ---------------------------------------------------------------------------
 # TerrainStatusTool
 # ---------------------------------------------------------------------------
-
-_TERRAIN_PATH: str = os.path.expanduser("~/.vector_os_nano/terrain_map.npz")
-
 
 @tool(
     name="terrain_status",
@@ -110,12 +112,12 @@ class TerrainStatusTool:
     input_schema: dict[str, Any] = {"type": "object", "properties": {}}
 
     def execute(self, params: dict[str, Any], context: ToolContext) -> ToolResult:
-        path = Path(_TERRAIN_PATH)
+        path = Path(terrain_map_file())
         data: dict[str, Any] = {
             "file_exists": path.exists(),
             "file_path": str(path),
             "file_size_kb": round(path.stat().st_size / 1024, 1) if path.exists() else 0,
-            "replay_triggered": os.path.exists("/tmp/vector_terrain_replay"),
+            "replay_triggered": os.path.exists(nav_replay_file()),
         }
         if path.exists():
             try:

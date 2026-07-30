@@ -6,9 +6,9 @@
 
 sensorMountingOffsets:
   ros__parameters:
-    sensorOffsetX: 0.2
+    sensorOffsetX: 0.3
     sensorOffsetY: 0.0
-    sensorOffsetZ: 0.1
+    sensorOffsetZ: 0.2
     cameraOffsetX: 0.1
     cameraOffsetY: 0.0
     cameraOffsetZ: -0.04
@@ -31,6 +31,14 @@ imu_preintegration_node:
 
 localPlanner:
   ros__parameters:
+    # Keep the planner's sensor/body transform consistent with the bridge.
+    sensorOffsetX: 0.3
+    sensorOffsetY: 0.0
+    twoWayDrive: false
+    useTerrainAnalysis: true
+    checkObstacle: true
+    checkRotObstacle: false
+
     # Obstacle height threshold — Go2 can step over ~3cm obstacles
     obstacleHeightThre: 0.08
 
@@ -44,6 +52,8 @@ localPlanner:
     # Speed limits
     maxSpeed: 0.8
     autonomySpeed: 0.8
+    autonomyMode: true
+    joyToSpeedDelay: 0.0
 
     # Path planning — larger range for better obstacle avoidance
     pathScale: 1.0         # was 0.8 — wider path search

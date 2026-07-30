@@ -48,12 +48,30 @@ sequences, verifies, and recovers; it does not re-implement nav/manip.
 > frontier-model **native tool-use producer** (`vcli/native_loop.py run_turn_native`): the MODEL drives
 > a ReAct loop (world skills + registry code tools + synthetic `verify`/`finish`) and assembles an
 > `ExecutionTrace` the honest verify spine (`trace_store`/`actor_causation`/`evidence_classifier`/
-> `verdict` — the "moat") grades BYTE-UNCHANGED, never looser (rule 5). **CEO ruling (D9): native IS the
+> `verdict` — the "moat") grades without a weaker bypass (rule 5). P1 extends that
+> spine additively with `in_room` and goal-scoped navigation causation; it does not
+> relax the existing evidence rules. **CEO ruling (D9): native IS the
 > design; the legacy hardcoded planner is wrong and is being strangled — optimize native, never retreat.**
 > Cutover LANDED: bare `vector-cli` + NL runs native by default (`VECTOR_REPL_NATIVE=0` = reversible
 > legacy hatch); legacy VGG (§2–8) remains only as the strangler-fig fallback, pending deletion.
-> Native nav routes through the avoidance planner (D14, `navigate`→FAR; `at_position` grades RAN until
-> actor-causation reaches cmd_vel). Live state + full decision history: `agent-kernel-STATUS.md` + `DECISIONS.md`.
+> Native base navigation has two public schemas: `navigate_room(room)` for semantic destinations and
+> `navigate_xy(x,y)` for explicit coordinates. Both are thin adapters over the formal `NavigateSkill`;
+> the named branch uses the shared `RoomResolver` rather than an LLM-owned coordinate table. The prompt
+> and execution therefore see the same live SceneGraph vocabulary (`known_layout`: prior rooms loaded
+> into the graph; `unknown_exploration`: discovered rooms only). Room arrival is verified with
+> `in_room(room_id)`, and goal-scoped proxy/bridge telemetry must show actual non-zero path-following
+> `cmd_vel` for that `goal_id` before actor causation can be CAUSED. Publishing a goal is not motion
+> evidence. In known-layout simulation, configured room/door geometry is authoritative over stale
+> persisted coordinates while learned objects and room history are retained. Live state + full
+> decision history: `agent-kernel-STATUS.md` + `DECISIONS.md`.
+> P2 makes that known-layout geometry executable: a schema-v2 room polygon/door graph is validated
+> before commit, and named navigation expands a trusted layout-prior route into
+> `door_pre → door_center → door_post → … → room_goal`. Every point is a separate fail-closed FAR
+> segment; the bridge must ACK its exact goal/segment-scoped motion policy before the segment
+> is submitted. `NO_PATH`, timeout, abort, or an out-of-tolerance landing disarms autonomous
+> following, holds zero velocity, and never skips to a later door or room centre. Door segments
+> prohibit reverse but add no fixed low-speed cap: the path follower keeps its normal adaptive
+> speed and may still slow for obstacles, curvature, alignment, or waypoint approach.
 
 ---
 
@@ -235,6 +253,54 @@ These are the contracts the kernel guarantees. Anything that violates them is a 
   (an escalation ladder to a visual/VLM check exists for cases predicates cannot express;
   LLM judging is the last resort, not the default).
 
+- **Semantic navigation is deterministically grounded.** The native model gets distinct
+  `navigate_room(room)` and `navigate_xy(x,y)` schemas, both backed by the formal
+  `NavigateSkill`. `RoomResolver` is the only owner of room aliases, visible room IDs, and
+  room centres: it reads the live SceneGraph, exposes all graph-loaded prior rooms in
+  `known_layout`, and filters to online-discovered rooms in `unknown_exploration`. A named
+  room can never degrade to model-guessed XY. `in_room(room_id)` canonicalizes through the
+  same resolver and checks `room_at` / polygon / bounds before an explicitly recorded
+  `nearest_center` fallback; unknown names and unavailable geometry fail closed.
+
+- **Navigation evidence is goal-scoped.** Every navigation action has a `goal_id` carried
+  through the native adapter, proxy, and bridge. Actor causation consumes actual, non-zero
+  bridge `cmd_vel` attributed to that exact goal together with measured base displacement;
+  goal publication, background drift, zero commands, and commands from another goal are
+  insufficient. A successful tool return is not proof of arrival: `in_room` (semantic) or
+  `at_position` (coordinate) must independently pass for a GROUNDED verdict.
+  Coordinate transport and `at_position` use the same 0.5 m radius; slow cumulative progress,
+  rather than progress in a single sampling interval, feeds the configured stall watchdog.
+  Native recovery stops after three identical failed navigation/verifier pairs.
+
+- **Human output and machine diagnostics are separate surfaces.** Native CLI progress and
+  verdicts remain concise on stderr/stdout. Project INFO/DEBUG diagnostics are written to a
+  private rotating log file, while third-party SDK/HTTP wire DEBUG is suppressed even in
+  verbose mode. Diagnostic verbosity must never corrupt Rich rendering or expose full prompts
+  and request headers in the interactive terminal.
+
+- **Known-layout navigation is topology-first and fail-closed.** Schema-v2 layout rooms own
+  membership polygons; trusted doors own width, normal, shared-boundary centre, and one safe
+  standoff in each room. The SceneGraph rejects malformed geometry and observed shortcuts,
+  filters doors against the robot footprint plus clearance, then emits structured pre/centre/post
+  waypoints. FAR/localPlanner still owns obstacle avoidance between consecutive points. A unique
+  `segment_id` ACK proves the bridge installed each no-reverse/tolerance policy and any optional
+  speed cap at the final motor boundary before motion starts. Door waypoints deliberately omit
+  the optional cap and therefore use normal adaptive navigation speed.
+
+- **Managed navigation startup is planner-data ready, not merely process ready.** A CLI-owned
+  simulation prepares one isolated ROS domain before constructing any parent-process Node.
+  Startup requires stable DDS matches, adequate live odometry, and a non-empty FAR
+  `/viz_graph_topic` `global_vertex` marker; FAR drops goals before that graph exists, so a textual
+  Ready line or discovered topic is insufficient. The launcher remains the health boundary after
+  startup and exits if any navigation-critical child dies. Teardown stops the child group,
+  disconnects all proxies while session paths are still installed, releases the shared rclpy
+  context, then atomically merges and finalizes session terrain state.
+
+- **Arm kinematics belong to the arm adapter.** Piper owns a 6-DoF MuJoCo Jacobian FK/IK model;
+  SO-101 owns a separate 5-DoF Pinocchio/URDF solver. The Agent calls `arm.fk()` for state sync and
+  constructs the external SO-101 solver only for an adapter that explicitly exposes
+  `set_ik_solver`; one arm's kinematics must never be interpreted by the other's model.
+
 - **Closed-loop observation flow.** Each step's output is written to the per-run
   Blackboard. Downstream parameters bind to upstream outputs via `${step.output.path}`
   references, resolved by pure dict/list traversal (no code execution). `StepRecord`
@@ -282,6 +348,9 @@ relative to `vector_os_nano/`.
 **Engine and backends**
 - `vcli/engine.py` — VectorEngine: the tool-use loop, dispatch, VGG entry points, and the
   per-world verify-namespace binding.
+- `vcli/native_loop.py` — the default bare-CLI producer: model-owned tool-use over world
+  actions plus `verify` / `finish`; its room/XY navigation adapters delegate to the formal
+  skill and emit the same `ExecutionTrace` consumed by the honest-verification spine.
 - `vcli/backends/` — model adapters (`anthropic`, `openai_compat`) behind a common type.
 
 **VGG cognitive layer** (`vcli/cognitive/`)
@@ -332,9 +401,15 @@ relative to `vector_os_nano/`.
   (`holding_object`/`arm_at_home`/`placed_count`/`detect_objects`/`describe_scene`) are SINGLE-SOURCED
   in the kernel at `vcli/worlds/arm_sim_oracle.py` (so `RobotWorld` can reuse them without the kernel
   importing the playground); `playground/verify/arm_predicates.py` + `scene_predicates.py` are thin
-  re-export shims. The Go2 base predicates (`at_position`/`facing`/`visited`) still live here.
+  re-export shims. The Go2 base predicates (`at_position`/`facing`/`in_room`/`visited`) are
+  single-sourced in `vcli/worlds/go2_sim_oracle.py`; the playground shim re-exports them, and
+  both `PlaygroundWorld` and `RobotWorld` bind the applicable predicates to their live agent.
 
 **Tools, routing, prompt, session, permissions**
+- `navigation/room_resolver.py` + `room_layout.py` + `world_mode.py` — deterministic room vocabulary,
+  validated executable layout topology, live
+  SceneGraph resolution/membership, and the `known_layout` versus `unknown_exploration`
+  visibility boundary. They contain language aliases but never room coordinates.
 - `vcli/tools/` — general tools (file/bash/glob/grep/web) + world-contributed tool wrappers.
 - `vcli/intent_router.py` — category-filtered routing that trims the tool/context surface.
 - `vcli/dynamic_prompt.py` — the composable system prompt rebuilt as world state changes.

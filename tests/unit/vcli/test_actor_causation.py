@@ -32,7 +32,14 @@ from vector_os_nano.vcli.cognitive.trace_store import classify_step_evidence
 from vector_os_nano.vcli.cognitive.types import StepRecord, SubGoal
 
 ROBOT_ORACLES = frozenset(
-    {"at_position", "facing", "visited", "holding_object", "arm_at_home"}
+    {
+        "at_position",
+        "facing",
+        "in_room",
+        "visited",
+        "holding_object",
+        "arm_at_home",
+    }
 )
 
 
@@ -250,6 +257,7 @@ def test_holding_no_transition_is_uncaused() -> None:
 
 def test_is_robot_predicate_detection() -> None:
     assert is_robot_predicate("at_position(11.0, 3.0)", ROBOT_ORACLES) is True
+    assert is_robot_predicate("in_room('dining_room')", ROBOT_ORACLES) is True
     assert is_robot_predicate("arm_at_home()", ROBOT_ORACLES) is True
     # A dev predicate (not a robot oracle) is not graded.
     assert is_robot_predicate("file_exists('/tmp/x')", ROBOT_ORACLES) is False

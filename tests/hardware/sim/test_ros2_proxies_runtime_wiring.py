@@ -128,8 +128,10 @@ def _restore_modules(originals: dict[str, Any]) -> None:
 
 def _make_runtime_mock() -> MagicMock:
     rt = MagicMock(name="Ros2Runtime")
+    rt.ensure_initialized = MagicMock()
     rt.add_node = MagicMock()
     rt.remove_node = MagicMock()
+    rt.shutdown_if_idle = MagicMock(return_value=True)
     return rt
 
 
@@ -192,6 +194,7 @@ def test_go2_proxy_connect_uses_shared_runtime_when_env_on(monkeypatch):
             proxy = Go2ROS2Proxy()
             proxy.connect()
 
+            runtime_mock.ensure_initialized.assert_called_once_with()
             assert runtime_mock.add_node.called, (
                 "add_node should have been called on the shared runtime"
             )
@@ -202,6 +205,45 @@ def test_go2_proxy_connect_uses_shared_runtime_when_env_on(monkeypatch):
             assert getattr(proxy, "_shared_runtime_used", False) is True, (
                 "_shared_runtime_used must be True after shared-path connect"
             )
+    finally:
+        _unload_proxy_modules()
+        _restore_modules(originals)
+
+
+def test_go2_proxy_initialises_shared_runtime_before_node_creation(monkeypatch):
+    """The shared runtime must bind the ROS domain before Node captures it."""
+    monkeypatch.setenv("VECTOR_SHARED_EXECUTOR", "1")
+    originals = _inject_ros2_modules()
+    _unload_proxy_modules()
+
+    runtime_mock = _make_runtime_mock()
+    events: list[str] = []
+    fake_node_cls = sys.modules["rclpy.node"].Node
+    fake_node = fake_node_cls.return_value
+    runtime_mock.ensure_initialized.side_effect = lambda: events.append("ensure")
+    runtime_mock.add_node.side_effect = lambda _node: events.append("add")
+
+    def _construct_node(_name: str) -> MagicMock:
+        events.append("node")
+        return fake_node
+
+    fake_node_cls.side_effect = _construct_node
+
+    try:
+        with patch(
+            "vector_os_nano.hardware.ros2.runtime.get_ros2_runtime",
+            return_value=runtime_mock,
+        ), patch(
+            "vector_os_nano.hardware.sim.go2_ros2_proxy.time.sleep",
+            return_value=None,
+        ):
+            from vector_os_nano.hardware.sim.go2_ros2_proxy import Go2ROS2Proxy
+
+            proxy = Go2ROS2Proxy()
+            proxy.connect()
+
+            assert events[:3] == ["ensure", "node", "add"]
+            assert proxy._node is fake_node
     finally:
         _unload_proxy_modules()
         _restore_modules(originals)
@@ -234,6 +276,17 @@ def test_piper_proxy_connect_uses_shared_runtime_when_env_on(monkeypatch):
     fake_mj.mjtObj.mjOBJ_SITE = 6
 
     fake_base = MagicMock(name="base_proxy")
+    events: list[str] = []
+    fake_node_cls = sys.modules["rclpy.node"].Node
+    fake_node = fake_node_cls.return_value
+    runtime_mock.ensure_initialized.side_effect = lambda: events.append("ensure")
+    runtime_mock.add_node.side_effect = lambda _node: events.append("add")
+
+    def _construct_node(_name: str) -> MagicMock:
+        events.append("node")
+        return fake_node
+
+    fake_node_cls.side_effect = _construct_node
 
     try:
         with patch(
@@ -248,6 +301,8 @@ def test_piper_proxy_connect_uses_shared_runtime_when_env_on(monkeypatch):
             )
             proxy.connect()
 
+            assert events[:3] == ["ensure", "node", "add"]
+            runtime_mock.ensure_initialized.assert_called_once_with()
             assert runtime_mock.add_node.called, (
                 "add_node should have been called on the shared runtime"
             )
@@ -256,6 +311,10 @@ def test_piper_proxy_connect_uses_shared_runtime_when_env_on(monkeypatch):
                 "add_node must be called with proxy._node"
             )
             assert getattr(proxy, "_shared_runtime_used", False) is True
+
+            proxy.disconnect()
+            runtime_mock.remove_node.assert_called_once_with(added_node)
+            runtime_mock.shutdown_if_idle.assert_called_once_with()
     finally:
         _unload_proxy_modules()
         _restore_modules(originals)
@@ -273,6 +332,17 @@ def test_piper_gripper_proxy_connect_uses_shared_runtime_when_env_on(monkeypatch
     _unload_proxy_modules()
 
     runtime_mock = _make_runtime_mock()
+    events: list[str] = []
+    fake_node_cls = sys.modules["rclpy.node"].Node
+    fake_node = fake_node_cls.return_value
+    runtime_mock.ensure_initialized.side_effect = lambda: events.append("ensure")
+    runtime_mock.add_node.side_effect = lambda _node: events.append("add")
+
+    def _construct_node(_name: str) -> MagicMock:
+        events.append("node")
+        return fake_node
+
+    fake_node_cls.side_effect = _construct_node
 
     try:
         with patch(
@@ -286,6 +356,8 @@ def test_piper_gripper_proxy_connect_uses_shared_runtime_when_env_on(monkeypatch
             proxy = PiperGripperROS2Proxy()
             proxy.connect()
 
+            assert events[:3] == ["ensure", "node", "add"]
+            runtime_mock.ensure_initialized.assert_called_once_with()
             assert runtime_mock.add_node.called, (
                 "add_node should have been called on the shared runtime"
             )
@@ -294,6 +366,88 @@ def test_piper_gripper_proxy_connect_uses_shared_runtime_when_env_on(monkeypatch
                 "add_node must be called with proxy._node"
             )
             assert getattr(proxy, "_shared_runtime_used", False) is True
+
+            proxy.disconnect()
+            runtime_mock.remove_node.assert_called_once_with(added_node)
+            runtime_mock.shutdown_if_idle.assert_called_once_with()
+    finally:
+        _unload_proxy_modules()
+        _restore_modules(originals)
+
+
+@pytest.mark.parametrize("proxy_kind", ["arm", "gripper"])
+def test_piper_proxies_keep_legacy_direct_runtime_compatible(
+    monkeypatch,
+    proxy_kind,
+):
+    """VECTOR_SHARED_EXECUTOR=0 keeps direct rclpy init + spin behaviour."""
+    monkeypatch.setenv("VECTOR_SHARED_EXECUTOR", "0")
+    originals = _inject_ros2_modules()
+    _unload_proxy_modules()
+
+    fake_rclpy = sys.modules["rclpy"]
+    fake_rclpy.ok.return_value = False
+    runtime_mock = _make_runtime_mock()
+    events: list[str] = []
+    started_threads: list[threading.Thread] = []
+    fake_node_cls = sys.modules["rclpy.node"].Node
+    fake_node = fake_node_cls.return_value
+    fake_rclpy.init.side_effect = lambda: events.append("init")
+
+    def _construct_node(_name: str) -> MagicMock:
+        events.append("node")
+        return fake_node
+
+    def _capture_start(thread: threading.Thread) -> None:
+        started_threads.append(thread)
+
+    fake_node_cls.side_effect = _construct_node
+
+    try:
+        with patch(
+            "vector_os_nano.hardware.ros2.runtime.get_ros2_runtime",
+            return_value=runtime_mock,
+        ), patch.object(threading.Thread, "start", _capture_start), patch(
+            "os.path.exists",
+            return_value=True,
+        ), patch(
+            "vector_os_nano.hardware.sim.piper_ros2_proxy.time.sleep",
+            return_value=None,
+        ):
+            from vector_os_nano.hardware.sim.piper_ros2_proxy import (
+                PiperGripperROS2Proxy,
+                PiperROS2Proxy,
+            )
+
+            if proxy_kind == "arm":
+                fake_mj = sys.modules["mujoco"]
+                fake_model = MagicMock(name="MjModel")
+                fake_model.nv = 30
+                fake_model.nbody = 0
+                fake_model.jnt_qposadr = [0] * 20
+                fake_model.jnt_dofadr = [0] * 20
+                fake_mj.MjModel.from_xml_path.return_value = fake_model
+                fake_mj.MjData.return_value = MagicMock(name="MjData")
+                fake_mj.mj_name2id.return_value = 0
+                fake_mj.mjtObj = MagicMock()
+                fake_mj.mjtObj.mjOBJ_JOINT = 1
+                fake_mj.mjtObj.mjOBJ_SITE = 6
+                proxy = PiperROS2Proxy(
+                    base_proxy=MagicMock(),
+                    scene_xml_path="/fake/scene.xml",
+                )
+            else:
+                proxy = PiperGripperROS2Proxy()
+
+            proxy.connect()
+
+            assert events[:2] == ["init", "node"]
+            fake_rclpy.init.assert_called_once_with()
+            runtime_mock.ensure_initialized.assert_not_called()
+            runtime_mock.add_node.assert_not_called()
+            assert len(started_threads) == 1
+            assert proxy._shared_runtime_used is False
+            proxy.disconnect()
     finally:
         _unload_proxy_modules()
         _restore_modules(originals)

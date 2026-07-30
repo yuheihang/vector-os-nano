@@ -19,25 +19,32 @@ Grounding contract:
   the base is absent or not connected, every predicate FAILS SAFE (returns
   ``False``) — it must NEVER raise into the GoalVerifier sandbox.
 - Each predicate is a thin factory bound to the connected ``agent`` (and, for
-  ``visited``, the scenario's named rooms), so a world can drop them straight
-  into the verify namespace.
+  ``visited`` / ``in_room``, the scenario or SceneGraph room source), so a world
+  can drop them straight into the verify namespace.
 
 The predicates are side-effect-free: position / heading reads do not advance the
-sim. A "room" is an axis-aligned bounding box owned by the scenario; ``visited``
-checks the base's current xy against a named room's box.
+sim. Legacy ``visited`` checks an axis-aligned scenario box. The primary
+``in_room`` predicate delegates aliases and membership to the shared
+``RoomResolver``: ``room_at`` / polygon / bounds geometry is preferred, with an
+explicitly recorded ``nearest_center`` fallback only when geometry is unavailable.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, Callable
+
+from vector_os_nano.navigation.room_resolver import RoomResolver, UnknownRoom
 
 logger = logging.getLogger(__name__)
 
-# Tolerances (metres / radians). Deliberately generous: verify is a coarse gate
-# on "did the step reach roughly the intended state", not a precision check.
-_AT_POSITION_TOL_M: float = 0.5
+# Tolerances (metres / radians). ``AT_POSITION_TOL_M`` is public because motion
+# transports must not declare arrival outside the verifier's acceptance radius.
+# The private alias remains for compatibility with older imports.
+AT_POSITION_TOL_M: float = 0.5
+_AT_POSITION_TOL_M: float = AT_POSITION_TOL_M
 _FACING_TOL_RAD: float = math.radians(20.0)
 
 
@@ -132,6 +139,158 @@ def make_facing(agent: Any) -> Callable[..., bool]:
         return _angle_delta(yaw, target) <= t
 
     return facing
+
+
+@dataclass(frozen=True)
+class _BoundsRoom:
+    """Minimal immutable room node used for scenario-owned room bounds."""
+
+    room_id: str
+    center_x: float
+    center_y: float
+    bounds: tuple[float, float, float, float]
+    # Scenario rooms are explicitly supplied by the active world rather than
+    # leaked layout priors, so they remain visible in either world mode.
+    visit_count: int = 1
+
+
+class _BoundsSceneGraph:
+    """Read-only SceneGraph adapter over a scenario room-box mapping.
+
+    ``RoomResolver`` takes one SceneGraph-like source for both name availability
+    and membership. Playground scenarios already own exact room bounds but do not
+    need persistent spatial memory, so this adapter lets them use the same
+    resolver instead of duplicating alias or point-in-room logic.
+    """
+
+    def __init__(self, rooms: dict[str, tuple[float, float, float, float]]) -> None:
+        self._rooms: dict[str, _BoundsRoom] = {}
+        for name, box in rooms.items():
+            x_min, y_min, x_max, y_max = box
+            room_id = str(name)
+            self._rooms[room_id] = _BoundsRoom(
+                room_id=room_id,
+                center_x=(x_min + x_max) / 2.0,
+                center_y=(y_min + y_max) / 2.0,
+                bounds=box,
+            )
+
+    def get_all_rooms(self) -> list[_BoundsRoom]:
+        return list(self._rooms.values())
+
+    def get_room(self, room_id: str) -> _BoundsRoom | None:
+        return self._rooms.get(str(room_id))
+
+    def nearest_room(self, x: float, y: float) -> str | None:
+        if not self._rooms:
+            return None
+        return min(
+            self._rooms.values(),
+            key=lambda room: (
+                math.dist((float(x), float(y)), (room.center_x, room.center_y)),
+                room.room_id,
+            ),
+        ).room_id
+
+
+def _valid_room_boxes(
+    rooms: dict[str, tuple[float, float, float, float]] | None,
+) -> dict[str, tuple[float, float, float, float]]:
+    """Return a finite, normalized copy of a room-box mapping."""
+
+    normalized: dict[str, tuple[float, float, float, float]] = {}
+    for name, raw_box in (rooms or {}).items():
+        if not _is_box(raw_box):
+            continue
+        x_min, y_min, x_max, y_max = (float(v) for v in raw_box)
+        box = (x_min, y_min, x_max, y_max)
+        if (
+            all(math.isfinite(v) for v in box)
+            and x_min <= x_max
+            and y_min <= y_max
+        ):
+            normalized[str(name)] = box
+    return normalized
+
+
+class _InRoomPredicate:
+    """Callable room predicate with inspectable verification details.
+
+    ``GoalVerifier`` needs a boolean callable, while P1 also requires any
+    geometry downgrade to be observable. The latest call therefore records
+    ``verification_mode`` (``room_at`` / ``polygon`` / ``bounds`` /
+    ``nearest_center`` / ``unavailable``), its canonical target, and the current
+    room as public attributes without changing the boolean return contract.
+    """
+
+    def __init__(self, agent: Any, resolver: RoomResolver) -> None:
+        self._agent = agent
+        self._resolver = resolver
+        self.verification_mode: str = "unavailable"
+        self.canonical_room: str | None = None
+        self.current_room: str | None = None
+
+    def __call__(self, room_id: Any) -> bool:
+        self.verification_mode = "unavailable"
+        self.canonical_room = None
+        self.current_room = None
+
+        try:
+            canonical = self._resolver.canonicalize(room_id)
+        except (UnknownRoom, TypeError, ValueError):
+            # Unknown aliases fail closed before touching the robot.
+            return False
+        self.canonical_room = canonical
+
+        base = _get_base(self._agent)
+        if base is None:
+            return False
+        pos = _base_position(base)
+        if pos is None:
+            return False
+
+        try:
+            location = self._resolver.locate(pos[0], pos[1])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sim-oracle room resolution failed: %s", exc)
+            return False
+        self.verification_mode = location.verification_mode
+        self.current_room = location.canonical
+        return location.canonical == canonical
+
+
+def make_in_room(
+    agent: Any,
+    *,
+    scene_graph: Any = None,
+    rooms: dict[str, tuple[float, float, float, float]] | None = None,
+    resolver: RoomResolver | None = None,
+) -> Callable[..., bool]:
+    """Build ``in_room(room_id)`` over deterministic base + room ground truth.
+
+    Name canonicalization and point membership are single-sourced through the
+    shared :class:`RoomResolver`. A live SceneGraph may expose ``room_at``,
+    polygon/bounds data, or only room centres; the resolver uses them in that
+    order and records ``nearest_center`` when it must degrade. A playground can
+    instead supply scenario-owned ``rooms`` bounds, adapted to the same contract.
+
+    Unknown room names, unavailable bases, malformed geometry, and oracle read
+    errors all fail safe to ``False`` and never escape into ``GoalVerifier``.
+    """
+
+    if resolver is None:
+        from vector_os_nano.navigation.world_mode import world_mode_for_agent
+
+        room_boxes = _valid_room_boxes(rooms)
+        source = scene_graph
+        if source is None and room_boxes:
+            source = _BoundsSceneGraph(room_boxes)
+        resolver = RoomResolver(
+            source,
+            world_mode=world_mode_for_agent(agent),
+            room_bounds=room_boxes,
+        )
+    return _InRoomPredicate(agent, resolver)
 
 
 def make_visited(agent: Any, rooms: dict[str, tuple[float, float, float, float]]) -> Callable[..., bool]:

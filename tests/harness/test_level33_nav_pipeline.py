@@ -36,6 +36,13 @@ def _proxy_source() -> str:
     return inspect.getsource(mod)
 
 
+def _proxy_method_source(name: str) -> str:
+    """Return one proxy method without brittle fixed-character slicing."""
+
+    mod = importlib.import_module("vector_os_nano.hardware.sim.go2_ros2_proxy")
+    return inspect.getsource(getattr(mod.Go2ROS2Proxy, name))
+
+
 def _navigate_source() -> str:
     mod = importlib.import_module("vector_os_nano.skills.navigate")
     return inspect.getsource(mod)
@@ -80,9 +87,7 @@ class TestFARDetectionSignal:
 
     def test_waypoint_timestamp_reset_before_probe(self):
         """_last_waypoint_time must be reset to 0 before Phase 1 probe."""
-        src = _proxy_source()
-        nav_start = src.find("def navigate_to")
-        nav_body = src[nav_start:nav_start + 3000]
+        nav_body = _proxy_method_source("navigate_to")
         assert "_last_waypoint_time = 0" in nav_body, (
             "Must reset _last_waypoint_time before probe to ignore stale data"
         )
@@ -105,14 +110,13 @@ class TestPhase2NoDirectWaypoint:
         The loop body is ~1600 chars from the Phase 2 comment due to cancel/abort
         checks before the actual publish call. Use 2000 chars window.
         """
-        src = _proxy_source()
-        # Find the actual Phase 2 code block (after the docstring)
-        phase2_comment = src.find("# Phase 2: full navigation")
+        nav_body = _proxy_method_source("navigate_to")
+        # Find the actual Phase 2 code block (after the docstring).
+        phase2_comment = nav_body.find("# Phase 2: full navigation")
         if phase2_comment < 0:
-            phase2_comment = src.find("Phase 2")
+            phase2_comment = nav_body.find("Phase 2")
         assert phase2_comment > 0, "Phase 2 section not found"
-        # Use 2000 chars to cover cancel/abort/stall checks before the publish call
-        phase2 = src[phase2_comment:phase2_comment + 2000]
+        phase2 = nav_body[phase2_comment:]
         assert "_publish_goal_point" in phase2
 
     def test_phase2_no_direct_waypoint(self):

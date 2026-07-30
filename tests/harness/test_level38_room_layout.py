@@ -160,7 +160,7 @@ class TestConfigFileExists:
             data = yaml.safe_load(f)
         assert len(data.get("rooms", {})) == 8
 
-    def test_config_has_7_doors(self):
+    def test_config_has_9_physical_doors(self):
         import yaml
         path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
@@ -168,4 +168,6 @@ class TestConfigFileExists:
         )
         with open(path) as f:
             data = yaml.safe_load(f)
-        assert len(data.get("doors", {})) == 7, "Should have 7 doors (each room to hallway)"
+        assert len(data.get("doors", {})) == 9, (
+            "Layout must include the living-dining and kitchen-study openings"
+        )

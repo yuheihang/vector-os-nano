@@ -54,6 +54,7 @@ _PREDICATE_ORACLES: frozenset[str] = frozenset(
     {
         "at_position",
         "facing",
+        "in_room",
         "visited",
         "holding_object",
         "arm_at_home",

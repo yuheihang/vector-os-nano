@@ -15,6 +15,7 @@ ORACLES = frozenset(
         # predicate oracles (bool, goal-conditioned) — a bare call is GROUNDED
         "at_position",
         "facing",
+        "in_room",
         "visited",
         "holding_object",
         "arm_at_home",
@@ -38,6 +39,7 @@ GROUNDED = [
     "arm_at_home()",
     "holding_object('apple')",
     "facing(-1.57)",
+    "in_room('dining_room')",
     "visited('kitchen')",
     "path_contains('note.txt', 'note')",  # goal-conditioned bool — bare call OK
     "not holding_object()",  # the existing place verify

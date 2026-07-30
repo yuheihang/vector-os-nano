@@ -338,6 +338,34 @@ class TestSkillResult:
         # Because frozen, we can only check they compare equal
         assert r1 == r2
 
+    def test_serialization_roundtrip_preserves_diagnosis_code(self):
+        from vector_os_nano.core.types import SkillResult
+
+        result = SkillResult(
+            success=False,
+            result_data={"failed_segment_index": 2},
+            error_message="planner rejected segment",
+            diagnosis_code="segment_no_path",
+        )
+
+        payload = result.to_dict()
+
+        assert payload["diagnosis_code"] == "segment_no_path"
+        assert SkillResult.from_dict(payload) == result
+
+    def test_from_legacy_dict_defaults_diagnosis_code(self):
+        from vector_os_nano.core.types import SkillResult
+
+        result = SkillResult.from_dict(
+            {
+                "success": False,
+                "result_data": {},
+                "error_message": "old payload",
+            }
+        )
+
+        assert result.diagnosis_code == ""
+
 
 # ---------------------------------------------------------------------------
 # TaskStep

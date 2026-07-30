@@ -9,7 +9,7 @@ Publishes the topics the CMU/Ji Zhang nav stack expects:
   - /registered_scan (PointCloud2, 5 Hz, frame: map)
   - /joy (Joy, 2 Hz, fake LT trigger for autonomyMode)
   - /speed (Float32, 2 Hz, desired speed)
-  - TF: map→sensor, map→vehicle
+  - TF: map→sensor (sensor→vehicle is the launcher's one static edge)
   - Subscribes: /cmd_vel (TwistStamped) → go2.set_velocity()
 
 Usage:
@@ -19,6 +19,7 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import struct
@@ -66,17 +67,59 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from nav_msgs.msg import Odometry as OdometryMsg, Path
 from sensor_msgs.msg import PointCloud2, PointField, Joy, LaserScan as LaserScanMsg, Image, CompressedImage
-from geometry_msgs.msg import TwistStamped, Twist, TransformStamped, PointStamped, PolygonStamped, Point32
-from std_msgs.msg import Float32, Header
+from geometry_msgs.msg import (
+    TwistStamped,
+    Twist,
+    TransformStamped,
+    PointStamped,
+    PolygonStamped,
+    Point32,
+    PoseStamped,
+)
+from std_msgs.msg import Float32, Header, String
 from tf2_ros import TransformBroadcaster
+from visualization_msgs.msg import Marker
 import numpy as np
 
 from vector_os_nano.hardware.sim.mujoco_go2 import MuJoCoGo2
+from vector_os_nano.hardware.sim.go2_ros2_proxy import (
+    EXECUTED_PATH_TOPIC,
+    FAR_GLOBAL_PATH_TOPIC,
+    GoalMotionTracker,
+    LOCAL_PLANNER_PATH_TOPIC,
+    NAV_GOAL_CONTROL_TOPIC,
+    NAV_GOAL_TELEMETRY_TOPIC,
+    NAV_GOAL_TELEMETRY_VERSION,
+    NAV_SEGMENT_CONTROL_TOPIC,
+    NAV_SEGMENT_ACK_TOPIC,
+    NAV_SEGMENT_CONTROL_VERSION,
+    NavigationSegmentConstraints,
+)
 from vector_os_nano.hardware.sim.sim_clock import sim_tick_dt
+from vector_os_nano.navigation.frames import (
+    NAV_SENSOR_OFFSET_X_M,
+    NAV_SENSOR_OFFSET_Y_M,
+    NAV_SENSOR_OFFSET_Z_M,
+    body_to_sensor_position,
+)
+from vector_os_nano.navigation.runtime_files import (
+    explore_finished_file,
+    nav_active_file,
+    nav_replay_file,
+    nav_reset_file,
+    nav_stalled_file,
+    terrain_map_file,
+)
 
 # Path-follower nominal tick. Single source: the _follow_path timer period AND
 # the per-tick ramp constants inside it are calibrated against this.
 _PF_DT = 1.0 / 20.0
+
+# Segment policies apply only to autonomous path-derived motor writes.  Manual
+# teleoperation and emergency zero commands keep their direct authority.
+_SEGMENT_CONSTRAINED_SOURCES = frozenset(
+    {"path_follower", "wall_escape", "path_idle", "path_settle"}
+)
 
 # ---------------------------------------------------------------------------
 # Nav config loader (lazy, module-level cache)
@@ -119,9 +162,9 @@ def _nav(key: str, default: float) -> float:
 
 # Sensor mounting offset — on top of Go2 head, above all leg geoms.
 # Must match mujoco_go2.py _LIDAR_OFFSET and nav stack sensorOffset.
-_SENSOR_X: float = 0.3
-_SENSOR_Y: float = 0.0
-_SENSOR_Z: float = 0.2
+_SENSOR_X: float = NAV_SENSOR_OFFSET_X_M
+_SENSOR_Y: float = NAV_SENSOR_OFFSET_Y_M
+_SENSOR_Z: float = NAV_SENSOR_OFFSET_Z_M
 
 # Ceiling filter: points with height above ground exceeding this threshold are
 # excluded from /registered_scan. Matches FAR's vehicle_height (indoor.yaml: 1.0).
@@ -153,7 +196,7 @@ class TerrainAccumulator:
         self._count += len(points)
 
     def save(self, path: str) -> bool:
-        """Save grid as numpy npz. Returns True on success."""
+        """Atomically save the grid as numpy npz. Returns True on success."""
         if not self._grid:
             return False
         import numpy as np
@@ -161,23 +204,80 @@ class TerrainAccumulator:
         xs = np.array([k[0] for k in keys], dtype=np.int32)
         ys = np.array([k[1] for k in keys], dtype=np.int32)
         zs = np.array([self._grid[k] for k in keys], dtype=np.float32)
+        tmp_path = ""
         try:
             import os
+            import tempfile
+
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            np.savez_compressed(path, ix=xs, iy=ys, z=zs, voxel_size=np.float32(self._voxel_size))
+            with tempfile.NamedTemporaryFile(
+                dir=os.path.dirname(path),
+                prefix=".terrain-map-",
+                suffix=".npz",
+                delete=False,
+            ) as tmp:
+                tmp_path = tmp.name
+            np.savez_compressed(
+                tmp_path,
+                ix=xs,
+                iy=ys,
+                z=zs,
+                voxel_size=np.float32(self._voxel_size),
+            )
+            os.replace(tmp_path, path)
             return True
         except Exception:
             return False
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
 
     def load(self, path: str) -> bool:
-        """Load grid from npz. Returns True on success."""
+        """Transactionally load a validated grid from npz."""
         try:
+            import math
             import numpy as np
-            data = np.load(path)
-            self._voxel_size = float(data['voxel_size'])
-            self._grid = {}
-            for ix, iy, z in zip(data['ix'], data['iy'], data['z']):
-                self._grid[(int(ix), int(iy))] = float(z)
+
+            with np.load(path, allow_pickle=False) as data:
+                voxel_size = float(data["voxel_size"])
+                ix_values = np.asarray(data["ix"]).reshape(-1)
+                iy_values = np.asarray(data["iy"]).reshape(-1)
+                z_values = np.asarray(data["z"]).reshape(-1)
+            if (
+                not math.isfinite(voxel_size)
+                or voxel_size <= 0.0
+                or len(ix_values) == 0
+                or len(ix_values) != len(iy_values)
+                or len(ix_values) != len(z_values)
+            ):
+                return False
+
+            loaded: dict[tuple[int, int], float] = {}
+            for raw_ix, raw_iy, raw_z in zip(
+                ix_values, iy_values, z_values
+            ):
+                ix = int(raw_ix)
+                iy = int(raw_iy)
+                z = float(raw_z)
+                if (
+                    not math.isfinite(float(raw_ix))
+                    or not math.isfinite(float(raw_iy))
+                    or not math.isfinite(z)
+                    or float(raw_ix) != ix
+                    or float(raw_iy) != iy
+                ):
+                    return False
+                key = (ix, iy)
+                if key not in loaded or z > loaded[key]:
+                    loaded[key] = z
+
+            self._voxel_size = voxel_size
+            self._grid = loaded
             return True
         except Exception:
             return False
@@ -227,6 +327,40 @@ class Go2VNavBridge(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
+        # Path state is lifecycle state, not a fire-and-forget sensor stream.
+        # TRANSIENT_LOCAL retains the latest terminal empty Path so a late RViz
+        # subscription cannot resurrect or retain a previous run's route.
+        path_state_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        # P1-05: goal identity is carried separately from the planner's
+        # PointStamped topics so their frame_id remains the required "map".
+        # The tracker only counts a velocity after MuJoCo's plant-side
+        # cmd_motion counter confirms that set_velocity passed its control gate.
+        self._goal_motion = GoalMotionTracker()
+        self._goal_telemetry_pub = self.create_publisher(
+            String, NAV_GOAL_TELEMETRY_TOPIC, reliable_qos
+        )
+        self.create_subscription(
+            String,
+            NAV_GOAL_CONTROL_TOPIC,
+            self._goal_control_cb,
+            reliable_qos,
+        )
+        self._segment_constraints: NavigationSegmentConstraints | None = None
+        self._segment_ack_pub = self.create_publisher(
+            String, NAV_SEGMENT_ACK_TOPIC, reliable_qos
+        )
+        self.create_subscription(
+            String,
+            NAV_SEGMENT_CONTROL_TOPIC,
+            self._segment_control_cb,
+            reliable_qos,
+        )
 
         # Publishers — topics the Vector Nav Stack expects
         # /state_estimation must be RELIABLE — terrainAnalysis and sensorScanGeneration require it
@@ -264,7 +398,33 @@ class Go2VNavBridge(Node):
             Path, "/path", self._path_cb,
             QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=1)
         )
+        self._local_path_pub = self.create_publisher(
+            Path, LOCAL_PLANNER_PATH_TOPIC, path_state_qos
+        )
+        self._far_global_path_pub = self.create_publisher(
+            Path, FAR_GLOBAL_PATH_TOPIC, path_state_qos
+        )
+        self.create_subscription(
+            Path, "/global_path", self._far_global_path_cb, reliable_qos
+        )
+        # FAR does not publish nav_msgs/Path in the bundled stack.  Its actual
+        # global route is a LINE_STRIP Marker on /viz_path_topic; convert that
+        # raw visualization into the source-labelled Path consumed by RViz.
+        self.create_subscription(
+            Marker, "/viz_path_topic", self._far_path_marker_cb, reliable_qos
+        )
+        self._executed_path_pub = self.create_publisher(
+            Path, EXECUTED_PATH_TOPIC, path_state_qos
+        )
+        self._executed_path_msg = Path()
+        self._executed_path_msg.header.frame_id = "map"
+        self._last_executed_path_publish = 0.0
+        self._last_executed_xy: tuple[float, float] | None = None
         self._current_path: list = []
+        self._navigation_visual_active = False
+        self._local_path_clear_published = False
+        self._far_path_clear_published = False
+        self._publish_empty_navigation_paths()
 
         # Subscribe to /exploration_finish from TARE — stop path following when done
         from std_msgs.msg import Bool as BoolMsg
@@ -299,6 +459,7 @@ class Go2VNavBridge(Node):
 
         # Stuck detector state — triggers /reset_waypoint when no progress
         self._stuck_pos = None       # (x, y) at last check
+        self._stuck_heading: float | None = None
         self._stuck_count = 0        # consecutive checks with < 0.3m progress
         self._stuck_history: list = []  # (x, y) positions where /reset_waypoint was sent
         self._stuck_wall_clock: float = 0.0  # wall-clock time when first stuck detected
@@ -330,7 +491,6 @@ class Go2VNavBridge(Node):
 
         # Scene graph JSON topic (0.5 Hz) — structured data for Foxglove Raw Messages
         try:
-            from std_msgs.msg import String
             self._sg_json_pub = self.create_publisher(String, "/vector_os/scene_graph", 5)
             self.create_timer(2.0, self._publish_scene_graph_json)
         except ImportError:
@@ -357,17 +517,17 @@ class Go2VNavBridge(Node):
         # Terrain persistence — accumulates pointcloud voxels during explore.
         # Auto-saved every 30s while nav is active.
         self._terrain_acc = TerrainAccumulator(voxel_size=0.1)
-        self._terrain_map_path = os.path.expanduser("~/.vector_os_nano/terrain_map.npz")
+        self._terrain_map_path = terrain_map_file()
         self.create_timer(30.0, self._auto_save_terrain)
 
-        # Reset pose check (1 Hz) — triggered by /tmp/vector_reset_pose file flag
+        # Reset pose check (1 Hz) — triggered by the session reset file.
         self.create_timer(1.0, self._check_reset_flag)
 
         # Front obstacle detection from cached pointcloud
         self._cached_points: list = []
 
         # Navigation gate: path follower is DISABLED until explicitly enabled.
-        # Uses a file flag (/tmp/vector_nav_active) — 100% reliable, no ROS2
+        # Uses a session file flag — 100% reliable, no ROS2
         # message race conditions. explore.py creates this file when starting.
         self._nav_enabled = False
         self._goal_pub = self.create_publisher(
@@ -387,13 +547,15 @@ class Go2VNavBridge(Node):
         self._terrain_replay_count: int = 0
         self._terrain_replay_max: int = 50  # 5Hz × 10s = 50 frames (longer burst)
         self._terrain_replay_start: float = time.time() + _REPLAY_DELAY
-        terrain_path = os.path.expanduser("~/.vector_os_nano/terrain_map.npz")
+        terrain_path = self._terrain_map_path
         if os.path.isfile(terrain_path):
-            acc = TerrainAccumulator()
-            if acc.load(terrain_path):
-                self._terrain_replay_points = acc.to_pointcloud()
+            # Load into the live accumulator as well as the replay buffer.
+            # Otherwise the first 30 s auto-save contains only newly observed
+            # voxels and silently shrinks a valid persisted map.
+            if self._terrain_acc.load(terrain_path):
+                self._terrain_replay_points = self._terrain_acc.to_pointcloud()
                 self.get_logger().info(
-                    f"Loaded terrain map: {acc.size} voxels from {terrain_path} "
+                    f"Loaded terrain map: {self._terrain_acc.size} voxels from {terrain_path} "
                     f"— replay starts in {_REPLAY_DELAY:.0f}s"
                 )
                 # Delayed replay timer — checks if it's time to start
@@ -405,25 +567,341 @@ class Go2VNavBridge(Node):
             "Go2VNavBridge started — /state_estimation, /registered_scan, /joy, /speed"
         )
 
-    def _check_reset_flag(self) -> None:
-        """Check for reset pose request (1 Hz). Triggered by /tmp/vector_reset_pose."""
-        if os.path.exists("/tmp/vector_reset_pose"):
+    # ------------------------------------------------------------------
+    # Goal-scoped actor-causation telemetry (P1-05)
+    # ------------------------------------------------------------------
+
+    def _telemetry_position(self) -> tuple[float, float] | None:
+        """Read the plant position without letting telemetry affect control."""
+        try:
+            position = self._go2.get_position()
+            return (float(position[0]), float(position[1]))
+        except Exception:
             try:
-                os.remove("/tmp/vector_reset_pose")
+                odom = self._go2.get_odometry()
+                return (float(odom.x), float(odom.y))
+            except Exception:
+                return None
+
+    def _plant_cmd_motion(self) -> float | None:
+        """Read MuJoCo's cumulative accepted-command magnitude, fail closed."""
+        reader = getattr(self._go2, "cmd_motion", None)
+        if not callable(reader):
+            return None
+        try:
+            value = float(reader())
+        except Exception:
+            return None
+        return value if math.isfinite(value) else None
+
+    def _publish_goal_telemetry(self, event: dict | None) -> None:
+        if event is None:
+            return
+        try:
+            msg = String()
+            msg.data = json.dumps(event, separators=(",", ":"), sort_keys=True)
+            self._goal_telemetry_pub.publish(msg)
+        except Exception as exc:
+            self.get_logger().warn(f"Goal telemetry publish failed: {exc}")
+
+    def _publish_segment_ack(
+        self,
+        event: str,
+        *,
+        goal_id: str,
+        segment_id: str,
+        reason: str = "",
+    ) -> None:
+        """Acknowledge the exact segment generation applied at the motor seam."""
+
+        try:
+            ack = String()
+            ack.data = json.dumps(
+                {
+                    "version": NAV_SEGMENT_CONTROL_VERSION,
+                    "event": event,
+                    "goal_id": goal_id,
+                    "segment_id": segment_id,
+                    "reason": reason,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            self._segment_ack_pub.publish(ack)
+        except Exception as exc:
+            self.get_logger().warn(f"Segment ACK publish failed: {exc}")
+
+    def _segment_control_cb(self, msg: String) -> None:
+        """Apply only validated, active-goal segment policy generations."""
+        try:
+            payload = json.loads(msg.data)
+            if int(payload.get("version", -1)) != NAV_SEGMENT_CONTROL_VERSION:
+                return
+            event = str(payload.get("event", ""))
+            raw_goal_id = payload.get("goal_id")
+            goal_id = str(raw_goal_id).strip() if raw_goal_id is not None else None
+            if goal_id is None or not goal_id or len(goal_id) > 128:
+                return
+            raw_segment_id = payload.get("segment_id")
+            segment_id = (
+                str(raw_segment_id).strip()
+                if raw_segment_id is not None
+                else None
+            )
+            if (
+                segment_id is None
+                or not segment_id
+                or len(segment_id) > 128
+            ):
+                return
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+
+        active_goal = self._goal_motion.active_goal_id
+        if event == "clear":
+            current = self._segment_constraints
+            if (
+                current is None
+                or current.goal_id != goal_id
+                or current.segment_id != segment_id
+            ):
+                self._publish_segment_ack(
+                    "REJECTED",
+                    goal_id=goal_id,
+                    segment_id=segment_id,
+                    reason="stale_clear",
+                )
+                return
+            # Clearing a policy is also a motor barrier.  Stop and discard the
+            # completed segment's path before removing its limits, so control
+            # and cmd_vel callbacks cannot reorder into one unconstrained tick.
+            self._current_path = []
+            self._path_time = 0.0
+            if hasattr(self, "_pf_speed"):
+                self._pf_speed = 0.0
+                self._pf_lat = 0.0
+                self._pf_yawrate = 0.0
+                self._pf_point_id = 0
+            if hasattr(self, "_wall_escape_total"):
+                self._wall_escape_elapsed = self._wall_escape_total
+            self._apply_velocity(
+                0.0, 0.0, 0.0, source="segment_policy_clear_stop"
+            )
+            self._segment_constraints = None
+            self._publish_segment_ack(
+                "APPLIED",
+                goal_id=goal_id,
+                segment_id=segment_id,
+                reason="cleared",
+            )
+            return
+        if event != "set":
+            return
+
+        try:
+            constraints = NavigationSegmentConstraints.from_payload(payload)
+        except (TypeError, ValueError) as exc:
+            self._publish_segment_ack(
+                "REJECTED",
+                goal_id=goal_id,
+                segment_id=segment_id,
+                reason=f"invalid_policy:{exc}",
+            )
+            return
+        # Never cache a policy ahead of its goal.  The proxy repeats begin/set
+        # and proceeds only after this callback confirms an exact generation.
+        if constraints.goal_id != active_goal:
+            self._publish_segment_ack(
+                "REJECTED",
+                goal_id=goal_id,
+                segment_id=segment_id,
+                reason="goal_not_active",
+            )
+            return
+
+        # A newly acknowledged segment starts from rest and no stale local path.
+        self._current_path = []
+        self._path_time = 0.0
+        if hasattr(self, "_pf_speed"):
+            self._pf_speed = 0.0
+            self._pf_lat = 0.0
+            self._pf_yawrate = 0.0
+            self._pf_point_id = 0
+        if hasattr(self, "_wall_escape_total"):
+            self._wall_escape_elapsed = self._wall_escape_total
+        self._apply_velocity(
+            0.0, 0.0, 0.0, source="segment_policy_stop"
+        )
+        self._segment_constraints = constraints
+        self._publish_segment_ack(
+            "APPLIED",
+            goal_id=goal_id,
+            segment_id=segment_id,
+        )
+
+    def _active_segment_constraints(self) -> NavigationSegmentConstraints | None:
+        constraints = self._segment_constraints
+        if constraints is None:
+            return None
+        active_goal = self._goal_motion.active_goal_id
+        if constraints.goal_id is not None and constraints.goal_id != active_goal:
+            return None
+        return constraints
+
+    def _apply_velocity(
+        self,
+        vx: float,
+        vy: float,
+        vyaw: float,
+        *,
+        source: str,
+    ) -> None:
+        """Apply velocity, then report it only when the plant accepted it.
+
+        The direct plant call intentionally lives here as the single bridge
+        motor boundary.  Path-follower callers provide the equivalent of
+        ``self._go2.set_velocity(self._pf_speed, self._pf_lat, self._pf_yawrate)``.
+        """
+        vx = float(vx)
+        vy = float(vy)
+        vyaw = float(vyaw)
+        if source in _SEGMENT_CONSTRAINED_SOURCES:
+            constraints = self._active_segment_constraints()
+            if constraints is not None:
+                vx, vy, vyaw = constraints.constrain_velocity(vx, vy, vyaw)
+                # Keep the follower's ramp state aligned with what the plant
+                # actually receives; clearing a door policy must not unleash a
+                # stale 0.6 m/s accumulator on the next tick.
+                if hasattr(self, "_pf_speed"):
+                    self._pf_speed = vx
+                    self._pf_lat = vy
+                    self._pf_yawrate = vyaw
+        before = self._plant_cmd_motion()
+        self._go2.set_velocity(vx, vy, vyaw)
+        after = self._plant_cmd_motion()
+        executed_motion = (
+            max(0.0, after - before)
+            if before is not None and after is not None
+            else 0.0
+        )
+        event = self._goal_motion.record_velocity(
+            vx,
+            vy,
+            vyaw,
+            executed_motion=executed_motion,
+            position=self._telemetry_position(),
+            source=source,
+        )
+        self._publish_goal_telemetry(event)
+
+    def _finalize_active_goal(self, status: str) -> None:
+        goal_id = self._goal_motion.active_goal_id
+        if goal_id is None:
+            return
+        event = self._goal_motion.finalize(
+            goal_id,
+            status=status,
+            position=self._telemetry_position(),
+        )
+        if (
+            self._segment_constraints is not None
+            and self._segment_constraints.goal_id == goal_id
+        ):
+            self._segment_constraints = None
+        self._publish_goal_telemetry(event)
+
+    def _goal_control_cb(self, msg: String) -> None:
+        """Accept idempotent begin/finalize messages from Go2ROS2Proxy."""
+        try:
+            payload = json.loads(msg.data)
+            if int(payload.get("version", -1)) != NAV_GOAL_TELEMETRY_VERSION:
+                return
+            event = str(payload["event"])
+            raw_goal_id = payload["goal_id"]
+            if not isinstance(raw_goal_id, str):
+                return
+            goal_id = raw_goal_id.strip()
+            if not goal_id or len(goal_id) > 128:
+                return
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+
+        if event == "begin":
+            current = self._goal_motion.active_goal_id
+            if current == goal_id:
+                return  # proxy repeats begin alongside goal points
+            if current is not None:
+                # Stop and clear G123's path before accepting G124.  Otherwise
+                # one stale follower tick could be mislabeled as G124 motion.
+                self._apply_velocity(
+                    0.0, 0.0, 0.0, source="goal_superseded_stop"
+                )
+                self._finalize_active_goal("superseded")
+            if (
+                self._segment_constraints is not None
+                and self._segment_constraints.goal_id != goal_id
+            ):
+                self._segment_constraints = None
+            self._navigation_visual_active = False
+            self._publish_empty_navigation_paths()
+            if hasattr(self, "_pf_speed"):
+                self._pf_speed = 0.0
+                self._pf_lat = 0.0
+                self._pf_yawrate = 0.0
+                self._pf_point_id = 0
+            accepted = self._goal_motion.begin(
+                goal_id,
+                target_xy=payload.get("target_xy"),
+                position=self._telemetry_position(),
+            )
+            # Exploration completion is a lifecycle boundary, not a permanent
+            # motor inhibit.  A real navigation goal must always re-arm path
+            # consumption even when it starts before the 1 Hz nav-file watcher
+            # has observed the short flag-off interval after exploration.
+            self._exploration_finished = False
+            self._navigation_visual_active = True
+            self._publish_goal_telemetry(accepted)
+            return
+
+        if event == "finalize" and self._goal_motion.active_goal_id == goal_id:
+            # A failed/cancelled/succeeded goal is terminal at the actual motor
+            # boundary as well as in the proxy bookkeeping.
+            self._apply_velocity(0.0, 0.0, 0.0, source="goal_finalize_stop")
+            self._navigation_visual_active = False
+            self._publish_empty_navigation_paths()
+            self._cancel_far_goal_at_current_position()
+            if (
+                self._segment_constraints is not None
+                and self._segment_constraints.goal_id == goal_id
+            ):
+                self._segment_constraints = None
+            self._finalize_active_goal(str(payload.get("status", "failed")))
+
+    def _check_reset_flag(self) -> None:
+        """Check for a session-scoped reset pose request (1 Hz)."""
+        reset_file = nav_reset_file()
+        if os.path.exists(reset_file):
+            try:
+                os.remove(reset_file)
             except OSError:
                 pass
             self.get_logger().warn("RESET POSE — standing up at current position")
+            self._finalize_active_goal("cancelled")
             self._go2.reset_pose()
-            self._current_path = []
+            self._navigation_visual_active = False
+            self._publish_empty_navigation_paths()
             self._pf_speed = 0.0
             self._pf_lat = 0.0
             self._pf_yawrate = 0.0
 
     def _check_nav_flag(self) -> None:
         """Check file flag to enable/disable path following (1 Hz)."""
-        flag = os.path.exists("/tmp/vector_nav_active")
+        flag = os.path.exists(nav_active_file())
         if flag and not self._nav_enabled:
             self._nav_enabled = True
+            # Explore has no proxy goal-control message, so the nav gate is its
+            # visualization lifecycle boundary.
+            self._navigation_visual_active = True
             self._exploration_finished = False  # reset for new explore/navigate
             # Cancel startup terrain replay — new exploration generates fresh data.
             # Without this, old terrain_map.npz makes TARE think area is already explored.
@@ -433,12 +911,21 @@ class Go2VNavBridge(Node):
             self.get_logger().info("Navigation ENABLED (flag file detected)")
         elif not flag and self._nav_enabled:
             self._nav_enabled = False
-            self._current_path = []
-            self._go2.set_velocity(0.0, 0.0, 0.0)
+            self._navigation_visual_active = False
+            self._publish_empty_navigation_paths()
+            if hasattr(self, "_pf_speed"):
+                self._pf_speed = 0.0
+                self._pf_lat = 0.0
+                self._pf_yawrate = 0.0
+                self._pf_point_id = 0
+            if hasattr(self, "_wall_escape_total"):
+                self._wall_escape_elapsed = self._wall_escape_total
+            self._apply_velocity(0.0, 0.0, 0.0, source="nav_gate_stop")
+            self._finalize_active_goal("cancelled")
             self.get_logger().info("Navigation DISABLED (flag file removed)")
 
         # Check for terrain replay trigger (set by explore.py after exploration)
-        replay_flag = "/tmp/vector_terrain_replay"
+        replay_flag = nav_replay_file()
         if os.path.exists(replay_flag):
             try:
                 os.remove(replay_flag)
@@ -526,7 +1013,7 @@ class Go2VNavBridge(Node):
         if abs(linear) > 0.05 or abs(angular) > 0.05:
             vx = float(np.clip(linear * 0.8, -0.6, 0.8))
             vyaw = float(np.clip(angular * 2.0, -2.0, 2.0))
-            self._go2.set_velocity(vx, 0.0, vyaw)
+            self._apply_velocity(vx, 0.0, vyaw, source="joystick")
             self._last_cmd_time = time.time()
             self._teleop_until = time.time() + 0.5
             # Clear path so path follower doesn't resume after teleop
@@ -813,7 +1300,12 @@ class Go2VNavBridge(Node):
         self._piper_object_state_pub.publish(msg)
 
     def _cmd_vel_cb(self, msg: Twist) -> None:
-        self._go2.set_velocity(msg.linear.x, msg.linear.y, msg.angular.z)
+        self._apply_velocity(
+            msg.linear.x,
+            msg.linear.y,
+            msg.angular.z,
+            source="proxy_cmd_vel",
+        )
         self._last_cmd_time = time.time()
         # Skill-level velocity command — protect from path-follower override
         # for 0.5s. Go2ROS2Proxy.walk() republishes at 4Hz to keep this fresh.
@@ -829,12 +1321,10 @@ class Go2VNavBridge(Node):
         # Apply sensor offset: sensor frame is offset from body center
         # In the nav stack convention, state_estimation is in map→sensor frame
         heading = self._go2.get_heading()
-        cos_h = math.cos(heading)
-        sin_h = math.sin(heading)
-        # Sensor position = body position + rotated offset
-        sx = odom.x + cos_h * _SENSOR_X - sin_h * _SENSOR_Y
-        sy = odom.y + sin_h * _SENSOR_X + cos_h * _SENSOR_Y
-        sz = odom.z + _SENSOR_Z
+        sx, sy, sz = body_to_sensor_position(
+            (odom.x, odom.y, odom.z),
+            heading,
+        )
 
         msg = OdometryMsg()
         msg.header.stamp = now
@@ -853,6 +1343,7 @@ class Go2VNavBridge(Node):
         msg.twist.twist.angular.z = odom.vyaw
         self._odom_pub.publish(msg)
         self._diag_odom_count += 1
+        self._publish_executed_path_pose(odom, now)
 
         # TF: map → sensor
         t = TransformStamped()
@@ -868,19 +1359,43 @@ class Go2VNavBridge(Node):
         t.transform.rotation.w = odom.qw
         self._tf_broadcaster.sendTransform(t)
 
-        # TF: map → vehicle (body center, for visualization)
-        tv = TransformStamped()
-        tv.header.stamp = now
-        tv.header.frame_id = "map"
-        tv.child_frame_id = "vehicle"
-        tv.transform.translation.x = odom.x
-        tv.transform.translation.y = odom.y
-        tv.transform.translation.z = odom.z
-        tv.transform.rotation.x = odom.qx
-        tv.transform.rotation.y = odom.qy
-        tv.transform.rotation.z = odom.qz
-        tv.transform.rotation.w = odom.qw
-        self._tf_broadcaster.sendTransform(tv)
+    def _publish_executed_path_pose(self, odom, stamp) -> None:
+        """Append a throttled body pose to the explicit executed-path topic."""
+        if (
+            not self._navigation_visual_active
+            or not os.path.exists(nav_active_file())
+        ):
+            return
+        now_mono = time.monotonic()
+        if now_mono - self._last_executed_path_publish < 0.2:
+            return
+        xy = (float(odom.x), float(odom.y))
+        if (
+            self._last_executed_xy is not None
+            and math.hypot(
+                xy[0] - self._last_executed_xy[0],
+                xy[1] - self._last_executed_xy[1],
+            )
+            < 0.02
+        ):
+            return
+        pose = PoseStamped()
+        pose.header.stamp = stamp
+        pose.header.frame_id = "map"
+        pose.pose.position.x = xy[0]
+        pose.pose.position.y = xy[1]
+        pose.pose.position.z = float(odom.z)
+        pose.pose.orientation.x = float(odom.qx)
+        pose.pose.orientation.y = float(odom.qy)
+        pose.pose.orientation.z = float(odom.qz)
+        pose.pose.orientation.w = float(odom.qw)
+        self._executed_path_msg.header.stamp = stamp
+        self._executed_path_msg.poses.append(pose)
+        if len(self._executed_path_msg.poses) > 3000:
+            del self._executed_path_msg.poses[:500]
+        self._last_executed_xy = xy
+        self._last_executed_path_publish = now_mono
+        self._executed_path_pub.publish(self._executed_path_msg)
 
     def _publish_pointcloud(self) -> None:
         """Publish /registered_scan (PointCloud2 in map frame, live local lidar only).
@@ -972,6 +1487,9 @@ class Go2VNavBridge(Node):
         get_camera_pose(). This ensures the depth pixels align with cam_xpos/xmat
         used in grasp_point_from_rgbd for correct 3D reconstruction.
         """
+        retry_at = float(getattr(self, "_camera_retry_at", 0.0))
+        if time.monotonic() < retry_at:
+            return
         try:
             rgb = self._go2.get_camera_frame(320, 240)
             now = self.get_clock().now().to_msg()
@@ -1019,6 +1537,11 @@ class Go2VNavBridge(Node):
             if not hasattr(self, '_cam_err_logged'):
                 self.get_logger().warn(f"Camera render failed: {e}")
                 self._cam_err_logged = True
+            # Renderer construction can fail before assignment; retrying at
+            # 5 Hz then creates partially initialised EGL objects whose
+            # destructors flood stderr. Keep the bridge healthy and retry
+            # periodically in case the graphics context becomes available.
+            self._camera_retry_at = time.monotonic() + 30.0
 
     def _publish_nav_boundary(self) -> None:
         """Publish /navigation_boundary polygon from room_layout.yaml bounding box.
@@ -1058,41 +1581,167 @@ class Go2VNavBridge(Node):
         """
         if msg.data and not self._exploration_finished:
             self._exploration_finished = True
+            self._navigation_visual_active = False
             self.get_logger().warn("TARE exploration complete — replaying terrain for FAR")
             # Trigger terrain replay so FAR gets complete V-Graph data
             try:
-                with open("/tmp/vector_terrain_replay", "w") as f:
+                with open(nav_replay_file(), "w") as f:
                     f.write("1")
             except OSError:
                 pass
             # Stop robot after short delay for terrain replay to start
-            self._go2.set_velocity(0.0, 0.0, 0.0)
-            self._current_path = []
+            self._apply_velocity(
+                0.0, 0.0, 0.0, source="exploration_finished_stop"
+            )
+            self._publish_empty_navigation_paths()
             # Signal explore skill
             try:
-                with open("/tmp/vector_explore_finished", "w") as f:
+                with open(explore_finished_file(), "w") as f:
                     f.write("1")
             except OSError:
                 pass
 
+    def _new_empty_path(self) -> Path:
+        """Build a fresh empty map-frame Path for deterministic RViz clearing."""
+
+        msg = Path()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        return msg
+
+    def _publish_empty_navigation_paths(self) -> None:
+        """Clear every bridge-owned path at one navigation lifecycle boundary."""
+
+        self._current_path = []
+        self._path_time = 0.0
+        self._last_executed_xy = None
+        self._last_executed_path_publish = 0.0
+        self._executed_path_msg.poses.clear()
+        stamp = self.get_clock().now().to_msg()
+        self._executed_path_msg.header.stamp = stamp
+        self._executed_path_msg.header.frame_id = "map"
+        self._local_path_pub.publish(self._new_empty_path())
+        self._far_global_path_pub.publish(self._new_empty_path())
+        self._executed_path_pub.publish(self._executed_path_msg)
+        self._local_path_clear_published = True
+        self._far_path_clear_published = True
+
+    def _cancel_far_goal_at_current_position(self) -> None:
+        """Make FAR converge without resetting its learned visibility graph."""
+
+        try:
+            odom = self._go2.get_odometry()
+            msg = PointStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "map"
+            sx, sy, _sz = body_to_sensor_position(
+                (odom.x, odom.y, odom.z),
+                self._go2.get_heading(),
+            )
+            msg.point.x = sx
+            msg.point.y = sy
+            msg.point.z = 0.0
+            self._goal_pub.publish(msg)
+        except Exception as exc:
+            self.get_logger().warn(f"FAR goal cancellation failed: {exc}")
+
+    def _path_visualization_active(self) -> bool:
+        return (
+            self._navigation_visual_active
+            and os.path.exists(nav_active_file())
+        )
+
+    def _publish_far_path_or_clear(self, msg: Path) -> None:
+        if not self._path_visualization_active():
+            if not self._far_path_clear_published:
+                self._far_global_path_pub.publish(self._new_empty_path())
+                self._far_path_clear_published = True
+            return
+        self._far_global_path_pub.publish(msg)
+        self._far_path_clear_published = not bool(msg.poses)
+
+    def _far_global_path_cb(self, msg: Path) -> None:
+        """Compatibility adapter for FAR variants that publish nav_msgs/Path."""
+
+        self._publish_far_path_or_clear(msg)
+
+    def _far_path_marker_cb(self, msg: Marker) -> None:
+        """Convert bundled FAR's LINE_STRIP marker into a named Path topic."""
+
+        path = self._new_empty_path()
+        path.header.frame_id = msg.header.frame_id or "map"
+        if (
+            int(msg.action) not in (int(Marker.DELETE), int(Marker.DELETEALL))
+            and int(msg.type) == int(Marker.LINE_STRIP)
+        ):
+            stamp = self.get_clock().now().to_msg()
+            for point in msg.points:
+                pose = PoseStamped()
+                pose.header.stamp = stamp
+                pose.header.frame_id = path.header.frame_id
+                pose.pose.position.x = float(point.x)
+                pose.pose.position.y = float(point.y)
+                pose.pose.position.z = float(point.z)
+                pose.pose.orientation.w = 1.0
+                path.poses.append(pose)
+        self._publish_far_path_or_clear(path)
+
     def _path_cb(self, msg: Path) -> None:
-        """Store path for Python follower + log."""
-        if not self._nav_enabled or self._exploration_finished:
+        """Store path for Python follower and expose its local-planner origin."""
+        if not self._path_visualization_active():
+            if not self._local_path_clear_published:
+                self._local_path_pub.publish(self._new_empty_path())
+                self._local_path_clear_published = True
             return
 
         odom = self._go2.get_odometry()
         heading = self._go2.get_heading()
         cos_h = math.cos(heading)
         sin_h = math.sin(heading)
-        sx = odom.x + cos_h * _SENSOR_X - sin_h * _SENSOR_Y
-        sy = odom.y + sin_h * _SENSOR_X + cos_h * _SENSOR_Y
+        sx, sy, _sz = body_to_sensor_position(
+            (odom.x, odom.y, odom.z),
+            heading,
+        )
 
+        frame = str(msg.header.frame_id or "").strip().lstrip("/")
+        if frame not in {"map", "vehicle", "base_link", "sensor"}:
+            self._current_path = []
+            if not self._local_path_clear_published:
+                self._local_path_pub.publish(self._new_empty_path())
+                self._local_path_clear_published = True
+            now_mono = time.monotonic()
+            if now_mono - getattr(self, "_last_bad_path_frame_log", 0.0) > 3.0:
+                self._last_bad_path_frame_log = now_mono
+                self.get_logger().warn(
+                    f"Rejected /path with unsupported frame {frame!r}"
+                )
+            return
+
+        map_path = self._new_empty_path()
         new_path = []
         for p in msg.poses:
             lx, ly = p.pose.position.x, p.pose.position.y
-            mx = sx + lx * cos_h - ly * sin_h
-            my = sy + lx * sin_h + ly * cos_h
+            if frame == "map":
+                mx, my = float(lx), float(ly)
+            else:
+                origin_x, origin_y = (
+                    (sx, sy)
+                    if frame == "sensor"
+                    else (odom.x, odom.y)
+                )
+                mx = origin_x + lx * cos_h - ly * sin_h
+                my = origin_y + lx * sin_h + ly * cos_h
             new_path.append((mx, my))
+            pose = PoseStamped()
+            pose.header = map_path.header
+            pose.pose.position.x = float(mx)
+            pose.pose.position.y = float(my)
+            pose.pose.position.z = float(p.pose.position.z)
+            pose.pose.orientation.w = 1.0
+            map_path.poses.append(pose)
+
+        self._local_path_pub.publish(map_path)
+        self._local_path_clear_published = not bool(map_path.poses)
 
         self._current_path = new_path
         self._path_time = time.time()
@@ -1245,6 +1894,22 @@ class Go2VNavBridge(Node):
         if time.time() < _skill_until:
             return
 
+        # A failed required FAR segment removes the nav gate before returning.
+        # Hold zero here on the next 20 Hz follower tick, ahead of wall escape
+        # and path-idle recovery, rather than waiting for the 1 Hz flag timer.
+        if not os.path.exists(nav_active_file()):
+            self._current_path = []
+            self._path_time = 0.0
+            if hasattr(self, "_pf_speed"):
+                self._pf_speed = 0.0
+                self._pf_lat = 0.0
+                self._pf_yawrate = 0.0
+                self._pf_point_id = 0
+            self._apply_velocity(
+                0.0, 0.0, 0.0, source="nav_fail_closed_hold"
+            )
+            return
+
         # --- Wall escape mode: reactive, direction-aware ---
         # Re-scans surroundings EVERY tick to adapt to changing obstacles.
         # Lidar is mounted -20° tilt on head (0.3m forward) — rear coverage
@@ -1258,11 +1923,28 @@ class Go2VNavBridge(Node):
             back_clear = back_d > 0.40
             left_clear = left_d > 0.25
             right_clear = right_d > 0.25
+            constraints = self._active_segment_constraints()
+            no_reverse = (
+                constraints is not None and not constraints.allow_reverse
+            )
+            turn_sign = (
+                math.copysign(1.0, self._pf_yawrate)
+                if abs(self._pf_yawrate) > 0.05
+                else (1.0 if left_d >= right_d else -1.0)
+            )
 
             if self._wall_escape_elapsed < self._wall_escape_phase2_at:
                 # Phase 1: try to reverse — but only if back is clear
                 if back_clear:
-                    tgt_vx, tgt_vy, tgt_yaw = -0.35, 0.0, 0.0
+                    if no_reverse:
+                        # Required door segments cannot legally reverse.  Keep
+                        # the gait engaged with the same normal forward-turn
+                        # speed used by the doorway controller.
+                        tgt_vx, tgt_vy, tgt_yaw = (
+                            0.15, 0.0, 0.4 * turn_sign
+                        )
+                    else:
+                        tgt_vx, tgt_vy, tgt_yaw = -0.35, 0.0, 0.0
                 else:
                     # Back blocked — turn in place toward most open side
                     if right_d > left_d:
@@ -1280,7 +1962,11 @@ class Go2VNavBridge(Node):
                 else:
                     tgt_vy = 0.0
                     tgt_yaw = 0.4 if left_d > right_d else -0.4
-                tgt_vx = -0.10 if back_clear else 0.0
+                tgt_vx = (
+                    0.15
+                    if no_reverse
+                    else (-0.10 if back_clear else 0.0)
+                )
 
             # Moderate ramp — responsive but not violent (per-tick, dt-scaled)
             _A = 0.04 * tick
@@ -1290,7 +1976,12 @@ class Go2VNavBridge(Node):
             else: self._pf_lat = max(tgt_vy, self._pf_lat - 0.03 * tick)
             if self._pf_yawrate < tgt_yaw: self._pf_yawrate = min(tgt_yaw, self._pf_yawrate + 0.06 * tick)
             else: self._pf_yawrate = max(tgt_yaw, self._pf_yawrate - 0.06 * tick)
-            self._go2.set_velocity(self._pf_speed, self._pf_lat, self._pf_yawrate)
+            self._apply_velocity(
+                self._pf_speed,
+                self._pf_lat,
+                self._pf_yawrate,
+                source="wall_escape",
+            )
             self._last_cmd_time = now
             return
 
@@ -1358,7 +2049,12 @@ class Go2VNavBridge(Node):
             if abs(self._pf_speed) < 0.01: self._pf_speed = 0.0
             if abs(self._pf_lat) < 0.01: self._pf_lat = 0.0
             if abs(self._pf_yawrate) < 0.01: self._pf_yawrate = 0.0
-            self._go2.set_velocity(self._pf_speed, self._pf_lat, self._pf_yawrate)
+            self._apply_velocity(
+                self._pf_speed,
+                self._pf_lat,
+                self._pf_yawrate,
+                source="path_settle",
+            )
             return
 
         has_path = (self._current_path
@@ -1387,7 +2083,12 @@ class Go2VNavBridge(Node):
                 if self._pf_yawrate < tgt_yaw: self._pf_yawrate = min(tgt_yaw, self._pf_yawrate + 0.03 * tick)
                 else: self._pf_yawrate = max(tgt_yaw, self._pf_yawrate - 0.03 * tick)
                 self._pf_lat *= decay  # decay lateral
-            self._go2.set_velocity(self._pf_speed, self._pf_lat, self._pf_yawrate)
+            self._apply_velocity(
+                self._pf_speed,
+                self._pf_lat,
+                self._pf_yawrate,
+                source="path_idle",
+            )
             self._last_cmd_time = time.time()
             self._pf_point_id = 0
             return
@@ -1494,7 +2195,11 @@ class Go2VNavBridge(Node):
         elif self._pf_turning:
             # MODE 2: TURN — heading error large
             if abs_err > 2.1:  # >120° — target is behind
-                vx = -0.15     # reverse toward target
+                # A long-range goal behind the dog is an alignment problem,
+                # not a reason to drive backwards.  Hold XY until the loaded
+                # MPC yaw converges; this is valid under every segment policy
+                # and avoids a long blind reverse through the hallway.
+                vx = 0.0
                 vy = 0.0
                 vyaw = _eff_yaw_gain_turn * dir_diff * 0.5
             elif _in_narrow:
@@ -1513,7 +2218,10 @@ class Go2VNavBridge(Node):
             err_scale = max(0.4, math.cos(abs_err))
             track_speed = target_speed * err_scale
             vx = track_speed * math.cos(dir_diff)
-            vy = -track_speed * math.sin(dir_diff)
+            # BaseProtocol: positive body-y is LEFT.  A positive heading error
+            # therefore needs positive vy; the former minus sign drove left-side
+            # paths to the robot's right.
+            vy = track_speed * math.sin(dir_diff)
             vy = max(-_MAX_LAT, min(_MAX_LAT, vy))
             vyaw = _YAW_GAIN_TRACK * dir_diff
 
@@ -1588,7 +2296,12 @@ class Go2VNavBridge(Node):
         self._pf_speed = float(np.clip(self._pf_speed, -0.3, _MAX_SPEED))
         self._pf_lat = float(np.clip(self._pf_lat, -_MAX_LAT, _MAX_LAT))
 
-        self._go2.set_velocity(self._pf_speed, self._pf_lat, self._pf_yawrate)
+        self._apply_velocity(
+            self._pf_speed,
+            self._pf_lat,
+            self._pf_yawrate,
+            source="path_follower",
+        )
         self._last_cmd_time = time.time()
 
         if not hasattr(self, '_follow_count'):
@@ -1623,7 +2336,7 @@ class Go2VNavBridge(Node):
                     return  # don't zero velocity during exploration startup
             except ImportError:
                 pass
-            self._go2.set_velocity(0.0, 0.0, 0.0)
+            self._apply_velocity(0.0, 0.0, 0.0, source="safety_stop")
 
     def _stuck_detector(self) -> None:
         """Detect when robot is stuck and take recovery action.
@@ -1635,18 +2348,42 @@ class Go2VNavBridge(Node):
         if not self._nav_enabled:
             self._stuck_count = 0
             self._stuck_pos = None
+            self._stuck_heading = None
             self._stuck_wall_clock = 0.0
             return
 
         odom = self._go2.get_odometry()
         cur = (odom.x, odom.y)
+        heading = self._go2.get_heading()
+
+        # /reset_waypoint and the generic reverse/strafe recovery belong to
+        # TARE exploration.  During a goal-scoped FAR segment they can replace
+        # a valid FAR waypoint and make localPlanner turn away from the room
+        # goal.  The proxy already owns a cumulative distance-to-segment
+        # watchdog, while the follower retains its near-obstacle wall escape.
+        if self._active_segment_constraints() is not None:
+            self._stuck_count = 0
+            self._stuck_pos = cur
+            self._stuck_heading = heading
+            self._stuck_wall_clock = 0.0
+            return
 
         if self._stuck_pos is not None:
             dx = cur[0] - self._stuck_pos[0]
             dy = cur[1] - self._stuck_pos[1]
             moved = math.sqrt(dx * dx + dy * dy)
+            turned = 0.0
+            if self._stuck_heading is not None:
+                turned = abs(heading - self._stuck_heading)
+                turned = min(turned, 2.0 * math.pi - turned)
 
-            if moved < 0.1:
+            # A quadruped aligning to a path can make legitimate angular
+            # progress with little XY displacement.  Do not interrupt that
+            # turn with a TARE reset/reverse recovery.
+            heading_progress = math.radians(
+                _nav("stall_heading_progress_deg", 3.0)
+            )
+            if moved < 0.1 and turned < heading_progress:
                 if self._stuck_count == 0:
                     # First stuck tick — record wall-clock start
                     self._stuck_wall_clock = time.time()
@@ -1658,9 +2395,11 @@ class Go2VNavBridge(Node):
                     self.get_logger().error(
                         "[NAV] Stalled for %.0fs, aborting navigation", _stall_timeout
                     )
-                    self._go2.set_velocity(0.0, 0.0, 0.0)
+                    self._apply_velocity(
+                        0.0, 0.0, 0.0, source="stuck_detector_stop"
+                    )
                     try:
-                        with open("/tmp/vector_nav_stalled", "w") as fh:
+                        with open(nav_stalled_file(), "w") as fh:
                             fh.write("1")
                     except OSError as exc:
                         self.get_logger().warn(f"[NAV] Could not write stall flag: {exc}")
@@ -1673,7 +2412,7 @@ class Go2VNavBridge(Node):
                 self._stuck_count = 0
                 self._stuck_wall_clock = 0.0
 
-            if self._stuck_count == 1:  # 2s — request TARE replan early
+            if self._stuck_count == 2:  # 4s — request TARE replan
                 msg = PointStamped()
                 msg.header.stamp = self.get_clock().now().to_msg()
                 msg.header.frame_id = "map"
@@ -1686,8 +2425,7 @@ class Go2VNavBridge(Node):
                     f"Stuck 4s at ({odom.x:.1f},{odom.y:.1f}) — "
                     f"sent /reset_waypoint to TARE"
                 )
-            elif self._stuck_count == 2:  # 4s — direction-aware escape
-                now = time.time()
+            elif self._stuck_count == 4:  # 8s — direction-aware escape
                 front_d, left_d, right_d, back_d = self._scan_surroundings()
                 _escape_dur = _nav("wall_escape_duration", 2.5)
                 self.get_logger().warn(
@@ -1731,6 +2469,7 @@ class Go2VNavBridge(Node):
                         self._stuck_history.clear()
 
         self._stuck_pos = cur
+        self._stuck_heading = heading
 
     def save_terrain(self) -> bool:
         """Save accumulated terrain map for next session."""

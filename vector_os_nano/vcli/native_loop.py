@@ -39,9 +39,13 @@ between-turn motion folds into the causation grade).
 """
 from __future__ import annotations
 
+import json
 import logging
+import math
 from typing import Any, Callable
 
+from vector_os_nano.navigation.room_resolver import RoomResolver
+from vector_os_nano.navigation.world_mode import get_world_mode
 from vector_os_nano.vcli.backends.types import LLMResponse
 from vector_os_nano.vcli.cognitive import actor_causation
 from vector_os_nano.vcli.cognitive.trace_store import verify_oracle_names
@@ -52,7 +56,7 @@ from vector_os_nano.vcli.cognitive.types import (
     SubGoal,
 )
 from vector_os_nano.vcli.tools.base import ToolContext, ToolResult
-from vector_os_nano.vcli.tools.skill_wrapper import wrap_skills
+from vector_os_nano.vcli.tools.skill_wrapper import SkillWrapperTool, wrap_skills
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +73,11 @@ _MAX_NATIVE_TURNS = 24
 # verify still terminates — the unverified action then grades honestly (empty/RAN),
 # never a false green. The verify stays MODEL-authored; the runner never invents it.
 _MAX_VERIFY_NUDGES = 2
+
+# A model-level retry is expensive and can move a physical robot. Three identical
+# failed navigation/verify pairs are enough to establish that the current route is
+# not recovering; stop honestly instead of consuming all 24 native turns.
+_MAX_IDENTICAL_NAV_FAILURES = 3
 
 # The registry category whose tools are the kernel's domain-general ACTION surface
 # (file_read/file_write/file_edit/bash/glob/grep — see tools.__init__._TOOL_CATEGORIES
@@ -90,10 +99,6 @@ def _at_position_tol() -> float:
         return 0.5
 
 
-# D9 #1 — the avoidance NAVIGATION route.
-_NAV_TIMEOUT_S = 60.0
-
-
 def _agent_base(context: ToolContext) -> Any:
     """The connected mobile base from the tool context's agent (the WIRED accessor).
 
@@ -106,75 +111,161 @@ def _agent_base(context: ToolContext) -> Any:
     return getattr(agent, "_base", None)
 
 
-class _NativeBaseNavigateTool:
-    """Coordinate navigation through the nav-stack AVOIDANCE route (D9 #1).
+def _structured_navigation_result(
+    result: ToolResult,
+    *,
+    tool_name: str,
+) -> ToolResult:
+    """Expose navigation metadata to the model as stable JSON, not Python repr."""
 
-    ``execute`` calls the connected base's ``navigate_to(x, y)`` — the go2 ROS2 proxy
-    method that sets the nav flag, publishes ``/goal_point`` to the FAR planner (which
-    routes over the lidar terrain map and AVOIDS obstacles), and blocks until arrival or
-    timeout. This is the obstacle avoidance the open-loop ``walk`` lacks. The planner
-    drives the base over ``cmd_vel``, which is GATED OUT of the actor-causation counter
-    (it runs on the bridge thread, never setting ``_skill_ctrl_tid``) — so a ``navigate``
-    step's ``at_position`` verify grades UNCAUSED and the spine downgrades GROUNDED -> RAN:
-    an HONEST "ran, cannot prove the actor caused it" until actor-causation is extended to
-    cmd_vel. The moat is never loosened (rule 5). Duck-typed like a ``Tool`` so
-    ``dispatch_skill`` runs it uniformly.
-    """
+    payload = dict(result.metadata or {})
+    payload.setdefault("tool", tool_name)
+    payload.setdefault("success", not result.is_error)
+    if result.is_error:
+        payload.setdefault("error", result.content)
+    return ToolResult(
+        content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        is_error=result.is_error,
+        metadata=payload,
+    )
 
-    name = "navigate"
+
+class _NativeNavigateRoomTool:
+    """Native named-room adapter over the one formal ``NavigateSkill``."""
+
+    name = "navigate_room"
     description = (
-        "Go to a world coordinate (x, y) using the navigation PLANNER, which AVOIDS "
-        "obstacles (lidar + local planner). Use this to REACH a place/coordinate. After "
-        "it returns, call verify(at_position(x, y))."
+        "Navigate to a NAMED room through the live SceneGraph and planner. Pass a "
+        "room name/alias only; coordinates are resolved internally. Unknown rooms "
+        "fail closed and list the currently available room IDs."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "x": {"type": "number", "description": "Target x (world frame, metres)."},
-            "y": {"type": "number", "description": "Target y (world frame, metres)."},
+            "room": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Named room or supported Chinese/English alias.",
+            },
         },
-        "required": ["x", "y"],
+        "required": ["room"],
+        "additionalProperties": False,
     }
 
+    def __init__(self, formal_tool: SkillWrapperTool) -> None:
+        self._formal_tool = formal_tool
+
     def execute(self, params: dict[str, Any], context: ToolContext) -> ToolResult:
-        try:
-            x = float(params["x"])
-            y = float(params["y"])
-        except (KeyError, TypeError, ValueError):
-            return ToolResult(content="navigate requires numeric x and y.", is_error=True)
-
-        base = _agent_base(context)
-        navigate_to = getattr(base, "navigate_to", None)
-        if not callable(navigate_to):
-            return ToolResult(
-                content="navigate: the connected base has no navigate_to (no nav stack).",
-                is_error=True,
+        if set(params) != {"room"} or not isinstance(params.get("room"), str):
+            return _structured_navigation_result(
+                ToolResult(
+                    content="navigate_room requires exactly one non-empty string 'room'.",
+                    is_error=True,
+                    metadata={"diagnosis_code": "invalid_room"},
+                ),
+                tool_name=self.name,
             )
-
-        try:
-            ok = bool(navigate_to(x, y, timeout=_NAV_TIMEOUT_S))
-        except TypeError:
-            # A base whose navigate_to does not accept a timeout kwarg.
-            try:
-                ok = bool(navigate_to(x, y))
-            except Exception as exc:  # noqa: BLE001
-                return ToolResult(content=f"navigate({x}, {y}) failed: {exc}", is_error=True)
-        except Exception as exc:  # noqa: BLE001
-            return ToolResult(content=f"navigate({x}, {y}) failed: {exc}", is_error=True)
-
-        pos = None
-        getter = getattr(base, "get_position", None)
-        if callable(getter):
-            try:
-                pos = getter()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("native_loop: navigate get_position failed: %s", exc)
-        where = f"({pos[0]:.2f}, {pos[1]:.2f})" if pos else "unknown"
-        status = "arrived" if ok else "did NOT confirm arrival (FAR graph unavailable or timeout)"
-        return ToolResult(
-            content=f"navigate: {status}; now at {where} (target ({x}, {y})). "
-            "Call verify(at_position) to confirm."
+        room = params["room"].strip()
+        if not room:
+            return _structured_navigation_result(
+                ToolResult(
+                    content="navigate_room requires a non-empty room.",
+                    is_error=True,
+                    metadata={"diagnosis_code": "invalid_room"},
+                ),
+                tool_name=self.name,
+            )
+        return _structured_navigation_result(
+            self._formal_tool.execute({"room": room}, context),
+            tool_name=self.name,
         )
+
+
+class _NativeNavigateXYTool:
+    """Native explicit-coordinate adapter over the formal ``NavigateSkill``."""
+
+    name = "navigate_xy"
+    description = (
+        "Navigate to an EXPLICIT world coordinate through FAR/local planning. Use "
+        "only when the user supplied numeric x/y or the goal is already an explicit "
+        "coordinate; never convert a named room into coordinates."
+    )
+    input_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "x": {"type": "number", "description": "Target x in world-frame metres."},
+            "y": {"type": "number", "description": "Target y in world-frame metres."},
+        },
+        "required": ["x", "y"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, formal_tool: SkillWrapperTool) -> None:
+        self._formal_tool = formal_tool
+
+    def execute(self, params: dict[str, Any], context: ToolContext) -> ToolResult:
+        if set(params) != {"x", "y"}:
+            valid = False
+        else:
+            valid = True
+            for value in (params.get("x"), params.get("y")):
+                # JSON Schema ``number`` means an actual numeric JSON value.
+                # Do not silently coerce strings such as ``"1.0"``: accepting
+                # those here would make the runtime contract looser than the
+                # schema advertised to the native model.
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    valid = False
+                    break
+                try:
+                    finite = math.isfinite(float(value))
+                except (OverflowError, TypeError, ValueError):
+                    finite = False
+                if not finite:
+                    valid = False
+                    break
+        if not valid:
+            return _structured_navigation_result(
+                ToolResult(
+                    content="navigate_xy requires exactly two finite numeric values x and y.",
+                    is_error=True,
+                    metadata={"diagnosis_code": "invalid_coordinate"},
+                ),
+                tool_name=self.name,
+            )
+        return _structured_navigation_result(
+            self._formal_tool.execute(
+                {"x": float(params["x"]), "y": float(params["y"])}, context,
+            ),
+            tool_name=self.name,
+        )
+
+
+def _agent_world_mode(agent: Any) -> str:
+    """Return the explicit world mode attached to the live agent."""
+
+    from vector_os_nano.navigation.world_mode import world_mode_for_agent
+
+    return world_mode_for_agent(agent).value
+
+
+def _scene_room_names(agent: Any) -> tuple[str, ...]:
+    """Return only canonical rooms currently visible through the live SceneGraph."""
+
+    if agent is None:
+        return ()
+    scene_graph = (
+        getattr(agent, "_spatial_memory", None)
+        or getattr(agent, "_scene_graph", None)
+    )
+    if scene_graph is None:
+        return ()
+    try:
+        return RoomResolver(
+            scene_graph, world_mode=_agent_world_mode(agent),
+        ).available_room_ids()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("native_loop: room-vocab extraction failed: %s", exc)
+        return ()
 
 
 def _scene_object_names(agent: Any) -> tuple[str, ...]:
@@ -302,6 +393,17 @@ class NativeStepRunner:
         self._chain: list[str] = []
         self._baseline: Any = None
         self._step_open: bool = False
+        self._result_data: dict[str, Any] = {}
+        self._pending_error: ToolResult | None = None
+        # Once a named-room lookup failed, the same turn may not "recover" by
+        # guessing coordinates or substituting another motor action. The failed
+        # NavigateSkill has already issued stop_navigation(); freezing the action
+        # surface makes "unknown room => robot remains stopped" deterministic.
+        # A later user turn gets a fresh runner.
+        self._room_resolution_failed: bool = False
+        self._failed_navigation_signature: tuple[str, str] | None = None
+        self._consecutive_navigation_failures: int = 0
+        self._navigation_recovery_exhausted: bool = False
 
         # The assembled trace pieces (one SubGoal + one StepRecord per verify pair).
         self._sub_goals: list[SubGoal] = []
@@ -317,6 +419,12 @@ class NativeStepRunner:
         """
         return self._step_open
 
+    @property
+    def navigation_recovery_exhausted(self) -> bool:
+        """True after too many identical failed navigation post-conditions."""
+
+        return self._navigation_recovery_exhausted
+
     # ------------------------------------------------------------------
     # Skill dispatch (capture baseline before the first skill of a step)
     # ------------------------------------------------------------------
@@ -328,6 +436,23 @@ class NativeStepRunner:
         call of the current step (review fix 3), then frozen — advancing the robot
         afterwards cannot mutate it (ActorBaseline is a value snapshot).
         """
+        if self._room_resolution_failed:
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        "tool": name,
+                        "success": False,
+                        "diagnosis_code": "room_resolution_failed",
+                        "error": (
+                            "No further action tools are allowed after unknown_room "
+                            "in this turn; report the available rooms without moving"
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                is_error=True,
+                metadata={"diagnosis_code": "room_resolution_failed"},
+            )
         tool = self._motor_tools.get(name)
         if tool is None:
             return ToolResult(content=f"Unknown tool '{name}'.", is_error=True)
@@ -337,10 +462,72 @@ class NativeStepRunner:
             self._step_open = True
         self._chain.append(name)
         try:
-            return tool.execute(params, self._ctx)
+            result = tool.execute(params, self._ctx)
         except Exception as exc:  # noqa: BLE001
             logger.debug("native_loop: skill '%s' raised: %s", name, exc)
-            return ToolResult(content=f"Skill '{name}' raised: {exc}", is_error=True)
+            result = ToolResult(
+                content=f"Skill '{name}' raised: {exc}",
+                is_error=True,
+                metadata={"diagnosis_code": "execution_failed"},
+            )
+        if result.metadata:
+            self._result_data.update(dict(result.metadata))
+        if result.is_error:
+            diag = str(
+                result.metadata.get("diagnosis_code")
+                or result.metadata.get("error_code")
+                or ""
+            )
+            if diag == "unknown_room":
+                self._room_resolution_failed = True
+                self._record_failed_action(result)
+            else:
+                # Let the model retry a transient failure in the same action
+                # chain. A later successful dispatch clears it; verify/build
+                # closes it as FAILED if no recovery occurred.
+                self._pending_error = result
+        else:
+            self._pending_error = None
+        return result
+
+    def _record_failed_action(self, result: ToolResult) -> None:
+        """Close an execution failure as an owned native step immediately.
+
+        This prevents the REPL's no-action fallback from dispatching a second,
+        legacy navigation after a real native attempt failed.
+        """
+
+        strategy = self._chain[-1] if self._chain else ""
+        step_name = f"native_step_{self._step_idx}"
+        self._step_idx += 1
+        self._sub_goals.append(
+            SubGoal(
+                name=step_name,
+                description=(
+                    f"native: {' -> '.join(self._chain) or '(no action)'} | "
+                    "execution failed before verification"
+                ),
+                verify="",
+                strategy=strategy,
+            )
+        )
+        self._steps.append(
+            StepRecord(
+                sub_goal_name=step_name,
+                strategy=strategy,
+                success=False,
+                verify_result=False,
+                duration_sec=0.0,
+                error=result.content,
+                result_data=dict(self._result_data),
+                actor_caused=actor_causation.ActorCaused.NOT_GRADED,
+            )
+        )
+        self._chain = []
+        self._baseline = None
+        self._step_open = False
+        self._result_data = {}
+        self._pending_error = None
 
     # ------------------------------------------------------------------
     # The verify-tool HANDLER — appends EXACTLY ONE StepRecord per pair
@@ -383,28 +570,91 @@ class NativeStepRunner:
         # it OR it is a pure check; verify_result + actor_caused carry the moat. A
         # verify-only step (no skill) still records success=True so the gate keys on
         # GROUNDED/RAN (a NO-OP must reach the verdict as RAN, not FAILED).
+        pending_error = self._pending_error
+        # A navigation controller may honestly time out after issuing real,
+        # plant-confirmed motion and changing pose. That action RAN even though it
+        # did not arrive; the failed in_room/at_position post-condition keeps it
+        # unverified. Preserve the diagnostic in ``error``/``result_data`` while
+        # classifying it as RAN rather than conflating it with a no-motion FAILED
+        # execution. Unknown-room failures close earlier and never reach this path.
+        pending_diagnosis = (
+            str(
+                pending_error.metadata.get("diagnosis_code")
+                or pending_error.metadata.get("error_code")
+                or ""
+            )
+            if pending_error is not None
+            else ""
+        )
+        navigation_ran = (
+            pending_error is not None
+            and strategy in {"navigate_room", "navigate_xy"}
+            and pending_diagnosis == "navigation_failed"
+            and actor_caused is actor_causation.ActorCaused.CAUSED
+        )
         step = StepRecord(
             sub_goal_name=step_name,
             strategy=strategy,
-            success=True,
+            success=pending_error is None or navigation_ran,
             verify_result=verify_result,
             duration_sec=0.0,
+            error=pending_error.content if pending_error is not None else "",
+            result_data=dict(self._result_data),
             actor_caused=actor_caused,
         )
         self._sub_goals.append(sub_goal)
         self._steps.append(step)
+        self._update_navigation_recovery_budget(
+            strategy=strategy,
+            expr=expr,
+            verify_result=verify_result,
+        )
 
         # Close the step: reset the action chain + baseline for the next pair. NEVER
         # carry a baseline across a verify (else the next step's causation folds in).
         self._chain = []
         self._baseline = None
         self._step_open = False
+        self._result_data = {}
+        self._pending_error = None
 
+        recovery_note = ""
+        if self._navigation_recovery_exhausted:
+            recovery_note = (
+                f"; navigation recovery stopped after "
+                f"{_MAX_IDENTICAL_NAV_FAILURES} identical failed attempts"
+            )
         return ToolResult(
             content=(
                 f"verify({expr}) -> {verify_word(verify_result)} "
                 f"(result={verify_result}, actor={actor_caused.value})"
+                f"{recovery_note}"
             )
+        )
+
+    def _update_navigation_recovery_budget(
+        self,
+        *,
+        strategy: str,
+        expr: str,
+        verify_result: bool,
+    ) -> None:
+        """Bound repeated physical navigation attempts for one post-condition."""
+
+        if verify_result or strategy not in {"navigate_room", "navigate_xy"}:
+            self._failed_navigation_signature = None
+            self._consecutive_navigation_failures = 0
+            self._navigation_recovery_exhausted = False
+            return
+        signature = (strategy, expr)
+        if signature == self._failed_navigation_signature:
+            self._consecutive_navigation_failures += 1
+        else:
+            self._failed_navigation_signature = signature
+            self._consecutive_navigation_failures = 1
+        self._navigation_recovery_exhausted = (
+            self._consecutive_navigation_failures
+            >= _MAX_IDENTICAL_NAV_FAILURES
         )
 
     def _grade(self, expr: str) -> "actor_causation.ActorCaused":
@@ -532,7 +782,13 @@ def run_turn_native(
         return runner.build_trace(user_message)
 
     system_prompt = _native_system_prompt(
-        engine, oracle_names, _scene_object_names(agent), has_navigate="navigate" in motor_tools
+        engine,
+        oracle_names,
+        _scene_object_names(agent),
+        room_names=_scene_room_names(agent),
+        world_mode=_agent_world_mode(agent) if agent is not None else None,
+        has_navigate_room="navigate_room" in motor_tools,
+        has_navigate_xy="navigate_xy" in motor_tools,
     )
     _append_user(session, user_message)
 
@@ -591,6 +847,7 @@ def run_turn_native(
             break  # end_turn, no tools — conversation complete
 
         finished = False
+        recovery_exhausted = False
         result_dicts: list[dict[str, Any]] = []
         for tc in tool_calls:
             if tc.name == FINISH_TOOL:
@@ -615,14 +872,21 @@ def run_turn_native(
                 expr = str((tc.input or {}).get("expr", ""))
                 _emit(f"verify {expr[:56]}")
                 res = runner.handle_verify(expr)
+                if runner.navigation_recovery_exhausted:
+                    _emit(
+                        "navigation recovery exhausted; reporting failure"
+                    )
+                    recovery_exhausted = True
             else:
                 _emit(f"{tc.name} {_progress_args(tc.input)}".strip())
                 res = runner.dispatch_skill(tc.name, dict(tc.input or {}))
             result_dicts.append(_tool_result_dict(tc.id, res.content, res.is_error))
+            if recovery_exhausted:
+                break
 
         _append_tool_results(session, result_dicts)
         turns += 1
-        if finished:
+        if finished or recovery_exhausted:
             break
 
     return runner.build_trace(user_message)
@@ -656,11 +920,11 @@ def _build_motor_tools(agent: Any, engine: Any) -> dict[str, Any]:
 
     Two sources, both world-agnostic by construction:
 
-    1. ``wrap_skills(agent)`` — the world's robot skills (``walk`` etc.). ``navigate``
-       is intentionally NOT surfaced as a step strategy: its cmd_vel is GATED OUT of
-       the actor-causation counter, so offering it would false-FAIL an honest move. We
-       drop it by construction (the acceptance pins per-step strategy == 'walk', never
-       'navigate'). When ``agent`` is None (the dev world), this source is empty.
+    1. ``wrap_skills(agent)`` — the world's formal robot skills. The kernel-level
+       ``navigate`` skill remains registered under its historical name, but native
+       exposes two unambiguous adapters: ``navigate_room(room)`` and
+       ``navigate_xy(x,y)``. Both execute that same formal skill; there is no second
+       room database and no coordinate guesser.
     2. The engine registry's ``code``-category tools (file_read/file_write/file_edit/
        bash/glob/grep) — the kernel's domain-general action surface, the SAME tools the
        legacy dev path dispatches via ``DEV_TOOL_ALLOWLIST`` + ``ToolDispatcher``. These
@@ -679,24 +943,36 @@ def _build_motor_tools(agent: Any, engine: Any) -> dict[str, Any]:
     # Source 2: the engine registry's code tools (present in every world).
     for name, code_tool in _code_tools_from_registry(engine).items():
         tools[name] = code_tool
-    # Source 3 (D9 #1): the avoidance NAVIGATION route, only for a world with a mobile
-    # base (go2). ``publish_goal`` -> FAR/local planner/lidar, so "go to a place/
-    # coordinate" AVOIDS obstacles instead of blind-walking into them. cmd_vel is gated
-    # out of actor-causation -> a navigate step honestly grades RAN (the moat never
-    # loosens). The arm/dev worlds (no base) do not get it.
-    if agent is not None and getattr(agent, "_base", None) is not None:
-        tools["navigate"] = _NativeBaseNavigateTool()
-    # Source 1: the world's skills (robot worlds only; dev world has no agent). The
-    # world's own ``navigate`` skill (door-chain walk, NOT lidar avoidance) stays
-    # excluded; our coordinate ``navigate`` above is the planner/avoidance route.
+
+    wrapped: list[SkillWrapperTool] = []
     if agent is not None:
         try:
-            for skill_tool in wrap_skills(agent):
-                if skill_tool.name == "navigate":
-                    continue  # world room-navigate is door-chain walk; ours is the avoidance route
-                tools[skill_tool.name] = skill_tool
+            wrapped = list(wrap_skills(agent))
         except Exception as exc:  # noqa: BLE001
             logger.debug("native_loop: wrap_skills failed: %s", exc)
+
+    formal_navigate = next(
+        (tool for tool in wrapped if tool.name == "navigate"), None,
+    )
+    base = getattr(agent, "_base", None) if agent is not None else None
+    if formal_navigate is None and agent is not None and base is not None:
+        # Some lightweight/test agents do not populate the registry. Still use the
+        # official implementation rather than reviving a native-only nav path.
+        try:
+            from vector_os_nano.skills.navigate import NavigateSkill
+
+            formal_navigate = SkillWrapperTool(NavigateSkill(), agent)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("native_loop: formal NavigateSkill unavailable: %s", exc)
+
+    for skill_tool in wrapped:
+        if skill_tool.name != "navigate":
+            tools[skill_tool.name] = skill_tool
+
+    if formal_navigate is not None and base is not None:
+        tools["navigate_room"] = _NativeNavigateRoomTool(formal_navigate)
+        if callable(getattr(base, "navigate_to", None)):
+            tools["navigate_xy"] = _NativeNavigateXYTool(formal_navigate)
     return tools
 
 
@@ -754,6 +1030,11 @@ def _native_system_prompt(
     oracle_names: frozenset[str],
     object_names: tuple[str, ...] = (),
     has_navigate: bool = False,
+    *,
+    room_names: tuple[str, ...] = (),
+    world_mode: str | None = None,
+    has_navigate_room: bool = False,
+    has_navigate_xy: bool = False,
 ) -> list[dict[str, Any]]:
     """A minimal native system prompt, single-sourcing the verify vocab.
 
@@ -769,6 +1050,9 @@ def _native_system_prompt(
     香蕉->banana) and the strictly-canonical oracle still matches. An EMPTY tuple
     (no world objects exposed) omits the list — the exact pre-step-7 prompt.
     """
+    # ``has_navigate`` is retained as a compatibility keyword for callers/tests
+    # predating P1; it now means the explicit-coordinate adapter.
+    has_navigate_xy = has_navigate_xy or has_navigate
     names = ", ".join(sorted(oracle_names)) if oracle_names else "(none)"
     tol = _at_position_tol()
     # Step 7: when the world exposes graspable object names, teach them so the model
@@ -783,24 +1067,50 @@ def _native_system_prompt(
         )
     else:
         object_vocab = ""
-    # Locomotion guidance: when the avoidance NAVIGATION route is available (a world
-    # with a mobile base, D9 #1) the model REACHES a place/coordinate via navigate(x, y)
-    # — the planner avoids obstacles — and uses walk only for an explicit relative step.
-    # Without it, fall back to the open-loop walk-toward-coordinate guidance.
-    if has_navigate:
-        locomotion_guidance = (
+
+    room_vocab = ""
+    if has_navigate_room:
+        mode = world_mode or get_world_mode().value
+        if room_names:
+            provenance = (
+                "known-layout priors currently loaded in the live SceneGraph"
+                if mode == "known_layout"
+                else "rooms discovered so far in this unknown world"
+            )
+            room_vocab = (
+                f"Named-room vocabulary ({provenance}): {', '.join(room_names)}. "
+            )
+        else:
+            room_vocab = (
+                "No named rooms are currently visible in the live SceneGraph. "
+            )
+        room_vocab += (
+            "For a NAMED destination, call navigate_room(room='<name-or-alias>'); "
+            "the tool resolves it against that live vocabulary. NEVER invent, expose, "
+            "or infer room coordinates. After success, verify "
+            "in_room('<canonical_room>') using canonical_room from the tool JSON. "
+            "If navigate_room reports unknown_room, accept that failure and the "
+            "available_rooms list: do NOT fall back to navigate_xy or walk. "
+        )
+
+    coordinate_guidance = ""
+    if has_navigate_xy:
+        coordinate_guidance = (
             f"at_position(x, y, tol={tol}) is True when the robot is within tol metres "
-            "of (x, y). To REACH a place or coordinate (x, y), call navigate(x, y): it "
-            "routes through the planner and AVOIDS obstacles (lidar + local planner). Do "
+            "of (x, y). Call navigate_xy(x, y) only when the USER EXPLICITLY supplies "
+            "a numeric coordinate OR a prior trusted perception/planning tool result "
+            "supplies explicit x/y; it routes through the planner and AVOIDS obstacles "
+            "(lidar + local planner). Never use navigate_xy for a named room. Do "
             "NOT walk toward a far target — walk is OPEN-LOOP and collides with anything "
             "in the way; use walk ONLY for an explicit short relative step the user asked "
-            "for (e.g. 'walk forward 2m'). After navigate, verify at_position(x, y). "
-            "CRITICAL — RECOVER on failure: if a verify returns FAIL, call navigate(x, y) "
-            "AGAIN and re-verify, repeating until at_position PASSES. NEVER call finish "
-            "while the latest verify is FAIL. Only finish once a verify has PASSED."
+            "for (e.g. 'walk forward 2m'). After navigate_xy, verify at_position(x, y). "
+            "RECOVER on failure only while the transport reports meaningful progress: "
+            "retry the same navigate_xy + verify pair at most "
+            f"{_MAX_IDENTICAL_NAV_FAILURES} total attempts. If it still fails, stop and "
+            "report the navigation failure; never loop indefinitely or claim success."
         )
-    else:
-        locomotion_guidance = (
+    elif not has_navigate_room:
+        coordinate_guidance = (
             f"at_position(x, y, tol={tol}) is True when the robot is within tol metres of "
             "(x, y). To reach a target coordinate, walk toward it (a forward walk "
             "advances along the robot's heading) and verify with at_position(x, y) for "
@@ -815,22 +1125,23 @@ def _native_system_prompt(
             "walk again and re-verify. Only finish once a verify has PASSED."
         )
     text = (
-        "You control a robot through tools. For each goal: call the MOTION skill or "
-        "navigate that achieves it, then IMMEDIATELY call verify(expr) with a "
+        "You control a robot through tools. For each goal: call the action tool "
+        "that achieves it, then IMMEDIATELY call verify(expr) with a "
         "deterministic predicate to PROVE the goal was achieved, then call finish. "
         "verify reads the real world state itself, so do NOT call a read-only "
         "status/query skill (e.g. where_am_i, look) before verify — the motion "
         "action must be the LAST action call before each verify. "
         f"Available verify predicate oracles: {names}. "
-        "Choose the predicate that MEASURES the goal quantity: a goal of reaching a "
-        "place/coordinate is proven by at_position (a position check), NOT by a "
-        "scene/description oracle. "
+        "Choose the predicate that MEASURES the goal quantity: a named-room goal is "
+        "proven by in_room, while an explicit coordinate is proven by at_position; "
+        "neither is proven by a scene/description oracle. "
         "A goal of picking up / grasping an object is proven by the holding_object(...) "
         "gripper oracle: call holding_object('<name>') with the object's scene name as a "
         "QUOTED string, e.g. holding_object('banana'), to prove you grasped THAT specific "
         "object (a bare word without quotes is not a valid argument). "
         + object_vocab
-        + locomotion_guidance
+        + room_vocab
+        + coordinate_guidance
     )
     return [{"type": "text", "text": text}]
 

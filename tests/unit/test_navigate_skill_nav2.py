@@ -95,10 +95,10 @@ def _make_nav2_context(nav_result: bool = True) -> SkillContext:
 
 
 def _make_fallback_context() -> SkillContext:
-    """Create a SkillContext without nav service (dead-reckoning mode).
+    """Create a SkillContext without any obstacle-aware navigation service.
 
-    The base mock explicitly does NOT have navigate_to so NavigateSkill
-    uses Mode 2 (dead-reckoning) rather than Mode 0 (proxy).
+    The base mock explicitly does NOT have navigate_to/go_to_waypoint.  P2 must
+    fail closed rather than convert a cross-room route into open-loop walk.
     """
     base = MagicMock(spec=["walk", "get_position", "get_heading", "set_velocity"])
     base.walk.return_value = True
@@ -210,14 +210,15 @@ class TestNavigateSkillNav2Mode:
         # Base.walk was NOT called (nav mode, not dead-reckoning)
         ctx.bases["go2"].walk.assert_not_called()
 
-    def test_fallback_uses_dead_reckoning_when_no_nav(self):
-        """Without nav service, should use base.walk dead-reckoning."""
+    def test_missing_nav_fails_closed_without_open_loop_walk(self):
+        """Without a planner, cross-room navigation must stop without walking."""
         ctx = _make_fallback_context()
         skill = NavigateSkill()
         result = skill.execute({"room": "kitchen"}, ctx)
-        # May or may not succeed (dead-reckoning is approximate)
-        # But base.walk should have been called
-        assert ctx.bases["go2"].walk.called
+        assert not result.success
+        assert result.diagnosis_code == "navigation_failed"
+        ctx.bases["go2"].walk.assert_not_called()
+        ctx.bases["go2"].set_velocity.assert_called_with(0.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------

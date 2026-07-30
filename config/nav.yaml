@@ -7,9 +7,21 @@ navigation:
   # 1.0m: obstacle band 0.5-1.0m (0.5m thick) — enough corners, thin enough for doors.
   # 1.8m: obstacle band 0.5-1.8m (1.3m thick) — too dense, doors invisible.
   arrival_radius: 0.8            # meters, consider arrived when closer than this
+  coordinate_timeout: 240.0      # seconds, one explicit-coordinate navigation budget
+  # Safe-room deadline:
+  # min(absolute max, max(base, door_count * per_door,
+  #                       total_polyline_metres * per_metre)).
+  # This keeps one-door behaviour bounded while preventing a 10-segment route
+  # from spending nearly the entire 360 s baseline on 35 s future-segment floors.
+  room_route_timeout: 360.0      # seconds, minimum whole-route budget
+  room_route_timeout_per_door: 300.0 # seconds, topology-complexity budget
+  room_route_timeout_per_meter: 55.0 # seconds per metre of planned body polyline
+  room_route_max_timeout: 1200.0 # seconds, absolute whole-route upper bound
+  room_route_min_segment_timeout: 35.0 # seconds, reserve for each door threshold
   far_probe_timeout: 3.0         # seconds, wait for FAR response before fallback
   waypoint_timeout: 30.0         # seconds, per-waypoint timeout in door-chain
-  stall_threshold: 0.3           # meters, minimum progress per stuck check interval
+  stall_threshold: 0.3           # metres of cumulative goal/body progress per watchdog window
+  stall_heading_progress_deg: 3.0 # actual rotation or heading-error reduction counts too
   stall_timeout: 30.0            # seconds, abort if no progress for this long
   wall_escape_duration: 2.5      # seconds, reverse + strafe escape maneuver
 

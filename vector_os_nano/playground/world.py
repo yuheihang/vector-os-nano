@@ -16,7 +16,7 @@ contribution is the verify namespace: deterministic sim-oracle predicates. The
 predicate set is chosen by the scenario's embodiment — ARM scenarios (tabletop)
 contribute arm/scene predicates over the connected arm + known objects; the GO2
 scenario (a mobile-base quadruped, ``has_base``) contributes base predicates
-(at_position / facing / visited) over the connected base. This proves the seam
+(at_position / facing / in_room / visited) over the connected base. This proves the seam
 generalizes across embodiments with no embodiment-specific code in the kernel.
 """
 
@@ -34,6 +34,7 @@ from vector_os_nano.playground.verify.arm_predicates import (
 from vector_os_nano.playground.verify.base_predicates import (
     make_at_position,
     make_facing,
+    make_in_room,
     make_rooms_producer,
     make_visited,
 )
@@ -103,7 +104,7 @@ class PlaygroundWorld:
           connected arm + the scenario's known objects; ``detect_objects`` /
           ``describe_scene`` REPLACE the engine's empty perception stubs.
         - the GO2 scenario contributes base predicates (at_position / facing /
-          visited) over the connected base + the scenario's named rooms.
+          in_room / visited) over the connected base + the scenario's named rooms.
 
         All predicates are bound to *agent* and fail safe when the hardware is
         unavailable (never raise into the GoalVerifier sandbox).
@@ -128,13 +129,14 @@ class PlaygroundWorld:
         }
 
     def _base_verify_namespace(self, agent: Any) -> dict[str, Any]:
-        # The scenario's named rooms become the source of truth for visited(),
-        # so a navigation sub-goal verifies "reached <room>" by scene name
-        # without hand-passing raw coordinates.
+        # The scenario's named rooms become the source of truth for in_room()
+        # (primary) and visited() (legacy), so a navigation sub-goal verifies
+        # "reached <room>" by scene name without hand-passing raw coordinates.
         rooms = self._scenario.rooms
         return {
             "at_position": make_at_position(agent),
             "facing": make_facing(agent),
+            "in_room": make_in_room(agent, rooms=rooms),
             "visited": make_visited(agent, rooms),
         }
 

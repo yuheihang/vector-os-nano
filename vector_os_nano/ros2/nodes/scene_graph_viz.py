@@ -18,8 +18,8 @@ Marker namespaces
     robot           -- ARROW at current robot position (teal, prominent)
     robot_body      -- CYLINDER showing robot footprint
     trajectory      -- LINE_STRIP showing robot path history
-    nav_goal        -- CYLINDER (pulsing red/coral) at navigation target
-    nav_goal_label  -- TEXT_VIEW_FACING showing "GOAL" above the cylinder
+    nav_goal        -- SPHERE (red) at navigation target
+    nav_goal_label  -- TEXT_VIEW_FACING showing "GOAL" above the sphere
 
 All markers are in the "map" frame.
 """
@@ -562,24 +562,24 @@ def _build_nav_goal_markers(
     nav_goal: tuple[float, float],
     start_id: int,
 ) -> tuple[list[Any], int]:
-    """Build nav goal cylinder + GOAL text label."""
+    """Build a red nav-goal sphere, ground ring, and GOAL text label."""
     markers: list[Any] = []
     mid = start_id
 
     gx, gy = nav_goal
 
-    # Tall cylinder — acts as beacon
-    cyl = _base_marker(header, "nav_goal", mid, _Marker.CYLINDER)
+    # Red sphere — matches the navigation visualization contract.
+    sphere = _base_marker(header, "nav_goal", mid, _Marker.SPHERE)
     mid += 1
-    cyl.pose.position.x = gx
-    cyl.pose.position.y = gy
-    cyl.pose.position.z = 0.60
-    cyl.pose.orientation.w = 1.0
-    cyl.scale.x = 0.40
-    cyl.scale.y = 0.40
-    cyl.scale.z = 1.20  # tall beacon
-    cyl.color = _make_color(1.00, 0.20, 0.20, 0.85)  # bold red
-    markers.append(cyl)
+    sphere.pose.position.x = gx
+    sphere.pose.position.y = gy
+    sphere.pose.position.z = 0.30
+    sphere.pose.orientation.w = 1.0
+    sphere.scale.x = 0.50
+    sphere.scale.y = 0.50
+    sphere.scale.z = 0.50
+    sphere.color = _make_color(1.00, 0.20, 0.20, 0.90)
+    markers.append(sphere)
 
     # Ring disc at base
     disc = _base_marker(header, "nav_goal", mid, _Marker.CYLINDER)
@@ -594,12 +594,12 @@ def _build_nav_goal_markers(
     disc.color = _make_color(1.00, 0.20, 0.20, 0.40)
     markers.append(disc)
 
-    # "GOAL" text above cylinder
+    # "GOAL" text above the sphere
     lbl = _base_marker(header, "nav_goal_label", mid, _Marker.TEXT_VIEW_FACING)
     mid += 1
     lbl.pose.position.x = gx
     lbl.pose.position.y = gy
-    lbl.pose.position.z = 1.40
+    lbl.pose.position.z = 0.85
     lbl.pose.orientation.w = 1.0
     lbl.text = "GOAL"
     lbl.scale.z = 0.40

@@ -155,9 +155,11 @@ class SkillWrapperTool:
             or getattr(result, "failure_reason", None)
             or f"Skill '{self.name}' failed."
         )
+        failure_data = dict(getattr(result, "result_data", None) or {})
         diag = getattr(result, "diagnosis_code", None)
         if diag:
             error_msg += f" ({diag})"
+            failure_data["diagnosis_code"] = str(diag)
             hint = _RECOVERY_HINTS.get(diag)
             if hint:
                 error_msg += f"\nSuggested: {hint}"
@@ -165,7 +167,8 @@ class SkillWrapperTool:
             post = self._get_post_state(agent)
             if post:
                 error_msg += f"\nCurrent state: {post}"
-        return ToolResult(content=error_msg, is_error=True)
+                failure_data["robot_state_after"] = post
+        return ToolResult(content=error_msg, is_error=True, metadata=failure_data)
 
     def _get_post_state(self, agent: Any) -> dict[str, Any] | None:
         """Snapshot robot state after skill execution."""

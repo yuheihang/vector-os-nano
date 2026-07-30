@@ -12,6 +12,7 @@ Supported query types:
     objects     — list all objects with category, room, position
     room_detail — full detail for a specific room (room info + objects + viewpoints)
     door_chain  — BFS waypoint list from src_room to dst_room
+    safe_route  — validated pre/centre/post doorway route with safety constraints
     coverage    — per-room coverage percentages
     summary     — human-readable room summary text (from get_room_summary)
 """
@@ -20,6 +21,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from vector_os_nano.navigation.room_resolver import (
+    RoomPositionUnknown,
+    RoomResolver,
+    UnknownRoom,
+)
 from vector_os_nano.vcli.tools.base import (
     ToolContext,
     ToolResult,
@@ -50,22 +56,24 @@ class SceneGraphQueryTool:
                     "objects",
                     "room_detail",
                     "door_chain",
+                    "safe_route",
                     "coverage",
                     "summary",
+                    "resolve_room",
                 ],
                 "description": "What to query from the SceneGraph.",
             },
             "room": {
                 "type": "string",
-                "description": "Room ID — required for room_detail.",
+                "description": "Room ID/name — required for room_detail or resolve_room.",
             },
             "src_room": {
                 "type": "string",
-                "description": "Source room ID — required for door_chain.",
+                "description": "Source room ID — required for door_chain or safe_route.",
             },
             "dst_room": {
                 "type": "string",
-                "description": "Destination room ID — required for door_chain.",
+                "description": "Destination room ID — required for door_chain or safe_route.",
             },
         },
         "required": ["query_type"],
@@ -100,10 +108,14 @@ class SceneGraphQueryTool:
             return self._query_room_detail(sg, params)
         elif query_type == "door_chain":
             return self._query_door_chain(sg, params)
+        elif query_type == "safe_route":
+            return self._query_safe_route(sg, params)
         elif query_type == "coverage":
             return self._query_coverage(sg)
         elif query_type == "summary":
             return self._query_summary(sg)
+        elif query_type == "resolve_room":
+            return self._resolve_room(sg, params, context)
         else:
             return ToolResult(
                 content=f"Unknown query_type: {query_type!r}",
@@ -130,6 +142,18 @@ class SceneGraphQueryTool:
 
     @staticmethod
     def _query_doors(sg: Any) -> ToolResult:
+        if hasattr(sg, "get_all_door_edges"):
+            edges = sg.get_all_door_edges()
+            data = []
+            for key, edge in sorted(edges.items()):
+                item = edge.to_dict()
+                # Keep the original flat coordinates for compatibility with
+                # clients written against the schema-v1 query response.
+                item["x"] = edge.center_x
+                item["y"] = edge.center_y
+                data.append(item)
+            return ToolResult(content=json.dumps(data, indent=2))
+
         doors_raw = sg.get_all_doors()
         data = [
             {
@@ -141,6 +165,36 @@ class SceneGraphQueryTool:
             for key, pos in doors_raw.items()
         ]
         return ToolResult(content=json.dumps(data, indent=2))
+
+    @staticmethod
+    def _query_safe_route(sg: Any, params: dict[str, Any]) -> ToolResult:
+        src = params.get("src_room")
+        dst = params.get("dst_room")
+        if not src or not dst:
+            return ToolResult(
+                content="src_room and dst_room are required for safe_route query.",
+                is_error=True,
+            )
+        planner = getattr(sg, "plan_door_route", None)
+        if not callable(planner):
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        "success": False,
+                        "diagnosis_code": "unsupported_scene_graph",
+                        "message": "SceneGraph does not expose plan_door_route().",
+                    },
+                    sort_keys=True,
+                ),
+                is_error=True,
+            )
+        route = planner(str(src), str(dst))
+        payload = route.to_dict()
+        return ToolResult(
+            content=json.dumps(payload, indent=2),
+            is_error=not bool(payload.get("success")),
+            metadata=payload,
+        )
 
     @staticmethod
     def _query_objects(sg: Any) -> ToolResult:
@@ -254,3 +308,59 @@ class SceneGraphQueryTool:
             pass
 
         return ToolResult(content=json.dumps(data, indent=2))
+
+    @staticmethod
+    def _resolve_room(
+        sg: Any,
+        params: dict[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        requested = params.get("room")
+        if not isinstance(requested, str) or not requested.strip():
+            return ToolResult(
+                content=json.dumps(
+                    {"success": False, "error_code": "invalid_room"},
+                    sort_keys=True,
+                ),
+                is_error=True,
+            )
+        agent = getattr(context, "agent", None)
+        world_mode = getattr(agent, "_world_mode", None)
+        try:
+            resolved = RoomResolver(sg, world_mode=world_mode).resolve(requested)
+        except UnknownRoom as exc:
+            payload = {
+                "success": False,
+                "error_code": "unknown_room",
+                "requested_room": requested,
+                "available_rooms": list(exc.available_rooms),
+            }
+            return ToolResult(
+                content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                is_error=True,
+                metadata=payload,
+            )
+        except RoomPositionUnknown as exc:
+            payload = {
+                "success": False,
+                "error_code": "room_position_unknown",
+                "requested_room": requested,
+                "canonical_room": exc.canonical,
+            }
+            return ToolResult(
+                content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                is_error=True,
+                metadata=payload,
+            )
+        payload = {
+            "success": True,
+            "requested_room": resolved.requested,
+            "canonical_room": resolved.canonical,
+            "target_xy": list(resolved.navigation_target),
+            "semantic_center_xy": list(resolved.center),
+            "source": resolved.source,
+        }
+        return ToolResult(
+            content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            metadata=payload,
+        )

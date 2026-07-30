@@ -14,6 +14,9 @@ All ROS2 imports are guarded so the SDK works without ROS2 installed.
 """
 from __future__ import annotations
 
+from importlib import import_module
+from typing import Any
+
 ROS2_AVAILABLE: bool = False
 try:
     import rclpy  # noqa: F401
@@ -21,20 +24,42 @@ try:
 except ImportError:
     pass
 
-if ROS2_AVAILABLE:
-    from vector_os_nano.ros2.nodes.hardware_bridge import HardwareBridgeNode
-    from vector_os_nano.ros2.nodes.perception_node import PerceptionBridgeNode
-    from vector_os_nano.ros2.nodes.skill_server import SkillServerNode
-    from vector_os_nano.ros2.nodes.world_model_node import WorldModelServiceNode
-    from vector_os_nano.ros2.nodes.agent_node import AgentNode
-
-    __all__ = [
-        "ROS2_AVAILABLE",
+_NODE_EXPORTS: dict[str, tuple[str, str]] = {
+    "HardwareBridgeNode": (
+        "vector_os_nano.ros2.nodes.hardware_bridge",
         "HardwareBridgeNode",
+    ),
+    "PerceptionBridgeNode": (
+        "vector_os_nano.ros2.nodes.perception_node",
         "PerceptionBridgeNode",
+    ),
+    "SkillServerNode": (
+        "vector_os_nano.ros2.nodes.skill_server",
         "SkillServerNode",
+    ),
+    "WorldModelServiceNode": (
+        "vector_os_nano.ros2.nodes.world_model_node",
         "WorldModelServiceNode",
+    ),
+    "AgentNode": (
+        "vector_os_nano.ros2.nodes.agent_node",
         "AgentNode",
-    ]
-else:
-    __all__ = ["ROS2_AVAILABLE"]
+    ),
+}
+
+__all__ = (
+    ["ROS2_AVAILABLE", *_NODE_EXPORTS]
+    if ROS2_AVAILABLE
+    else ["ROS2_AVAILABLE"]
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Load a requested ROS node without importing unrelated message stacks."""
+
+    if not ROS2_AVAILABLE or name not in _NODE_EXPORTS:
+        raise AttributeError(name)
+    module_name, attribute = _NODE_EXPORTS[name]
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value

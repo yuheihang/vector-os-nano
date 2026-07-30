@@ -29,6 +29,1145 @@ from vector_os_nano.vcli.tools.base import (
 
 logger = logging.getLogger(__name__)
 
+_VNAV_READY_MARKER = "Ready! Dog is standing still."
+# Linux DDS participants map ROS domains onto UDP ports.  Domains 215..232 put
+# the base DDS ports above the default ephemeral-port range while still keeping
+# CLI-owned sessions away from the conventional domain 0 graph.
+_SIM_ROS_DOMAIN_MIN = 215
+_SIM_ROS_DOMAIN_MAX = 232
+_ROS_DOMAIN_MAX = 232
+_GO2_REQUIRED_NAV_NODES = frozenset(
+    {
+        "go2_vnav_bridge",
+        "localPlanner",
+        "tare_planner_node",
+    }
+)
+_GO2_REQUIRED_NAV_NODE_ALIASES = (
+    # The C++ executable defaults to far_planner_node, while the installed
+    # launch file deliberately remaps it to far_planner.
+    frozenset({"far_planner", "far_planner_node"}),
+)
+_VNAV_SESSION_PATH_KEYS = (
+    "VECTOR_NAV_ACTIVE_FILE",
+    "VECTOR_NAV_STALLED_FILE",
+    "VECTOR_NAV_RESET_FILE",
+    "VECTOR_NAV_REPLAY_FILE",
+    "VECTOR_EXPLORE_FINISHED_FILE",
+    "VECTOR_TERRAIN_MAP_FILE",
+)
+
+
+def _select_sim_ros_domain_id() -> int:
+    """Choose a simulation-only ROS domain, ignoring generic shell pollution.
+
+    ``ROS_DOMAIN_ID`` may have been exported by an unrelated ROS workspace.  A
+    fresh Go2 run must not silently join that graph.  Only the deliberately
+    named ``VECTOR_SIM_ROS_DOMAIN_ID`` override is honoured; otherwise a high,
+    random domain is selected for this CLI-owned simulation session.
+    """
+
+    import os
+    import secrets
+
+    override = os.environ.get("VECTOR_SIM_ROS_DOMAIN_ID")
+    if override is not None:
+        try:
+            domain_id = int(override.strip())
+        except (AttributeError, ValueError) as exc:
+            raise ValueError(
+                "VECTOR_SIM_ROS_DOMAIN_ID must be an integer from 0 to 232"
+            ) from exc
+        if not 0 <= domain_id <= _ROS_DOMAIN_MAX:
+            raise ValueError(
+                "VECTOR_SIM_ROS_DOMAIN_ID must be an integer from 0 to 232"
+            )
+        return domain_id
+
+    span = _SIM_ROS_DOMAIN_MAX - _SIM_ROS_DOMAIN_MIN + 1
+    return _SIM_ROS_DOMAIN_MIN + secrets.randbelow(span)
+
+
+def _prepare_vnav_session_environment(
+    domain_id: int,
+) -> tuple[str, dict[str, str], dict[str, str | None]]:
+    """Create and install process-local paths for one navigation session.
+
+    The parent CLI and launch child intentionally receive the same values.
+    Keeping flags, logs, and terrain persistence in a unique directory prevents
+    a crashed process from contaminating a later run.  A pre-existing terrain
+    map is copied once as a read/write seed rather than shared live.
+    """
+
+    import os
+    import shutil
+    import tempfile
+
+    session_dir = tempfile.mkdtemp(prefix=f"vector-vnav-{os.getpid()}-")
+    explicit_log = os.environ.get("VECTOR_VNAV_LOG_FILE")
+    values = {
+        "ROS_DOMAIN_ID": str(domain_id),
+        "VECTOR_NAV_ACTIVE_FILE": os.path.join(session_dir, "nav_active"),
+        "VECTOR_NAV_STALLED_FILE": os.path.join(session_dir, "nav_stalled"),
+        "VECTOR_NAV_RESET_FILE": os.path.join(session_dir, "nav_reset"),
+        "VECTOR_NAV_REPLAY_FILE": os.path.join(session_dir, "nav_replay"),
+        "VECTOR_EXPLORE_FINISHED_FILE": os.path.join(
+            session_dir, "explore_finished"
+        ),
+        "VECTOR_TERRAIN_MAP_FILE": os.path.join(session_dir, "terrain_map.npz"),
+        "VECTOR_VNAV_LOG_FILE": (
+            os.path.abspath(os.path.expanduser(explicit_log))
+            if explicit_log
+            # Keep the retained diagnostic beside (not inside) the disposable
+            # control directory, so SimStop can remove session state without
+            # deleting the log path it reports to the user.
+            else f"{session_dir}.log"
+        ),
+    }
+    previous = {key: os.environ.get(key) for key in values}
+
+    default_terrain = _canonical_terrain_map_path()
+    if os.path.isfile(default_terrain):
+        try:
+            shutil.copy2(default_terrain, values["VECTOR_TERRAIN_MAP_FILE"])
+            if _load_valid_terrain_map(values["VECTOR_TERRAIN_MAP_FILE"]) is None:
+                os.remove(values["VECTOR_TERRAIN_MAP_FILE"])
+                logger.warning(
+                    "[sim_tool] canonical terrain map is invalid; starting "
+                    "without terrain seed: %s",
+                    default_terrain,
+                )
+        except OSError as exc:
+            logger.warning(
+                "[sim_tool] could not seed session terrain map from %s: %s",
+                default_terrain,
+                exc,
+            )
+
+    os.environ.update(values)
+    return session_dir, values, previous
+
+
+def _restore_vnav_session_environment(
+    values: dict[str, str],
+    previous: dict[str, str | None],
+) -> None:
+    """Restore env keys only when they still belong to this simulation."""
+
+    import os
+
+    for key, session_value in values.items():
+        if os.environ.get(key) != session_value:
+            continue
+        old_value = previous.get(key)
+        if old_value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old_value
+
+
+def _canonical_terrain_map_path() -> str:
+    """Return the canonical cross-session terrain seed path."""
+
+    import os
+
+    from vector_os_nano.navigation.runtime_files import (
+        DEFAULT_TERRAIN_MAP_FILE,
+    )
+
+    return os.path.abspath(os.path.expanduser(DEFAULT_TERRAIN_MAP_FILE))
+
+
+def _load_valid_terrain_map(
+    path: str,
+) -> tuple[dict[tuple[int, int], float], float] | None:
+    """Load one terrain NPZ after strict, non-pickle validation.
+
+    The bridge treats ``ix``/``iy`` as integer voxel indices and ``z`` as the
+    maximum observed height.  Refuse malformed, non-finite, non-integral, empty,
+    or out-of-range data instead of allowing a damaged session file to replace
+    the durable seed.
+    """
+
+    import math
+
+    try:
+        import numpy as np
+
+        with np.load(path, allow_pickle=False) as data:
+            if not {"ix", "iy", "z", "voxel_size"}.issubset(data.files):
+                return None
+            ix = np.asarray(data["ix"])
+            iy = np.asarray(data["iy"])
+            z = np.asarray(data["z"])
+            voxel_raw = np.asarray(data["voxel_size"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+    if ix.ndim != 1 or iy.ndim != 1 or z.ndim != 1:
+        return None
+    if not (len(ix) == len(iy) == len(z)) or len(ix) == 0:
+        return None
+    if voxel_raw.size != 1:
+        return None
+    if not all(
+        np.issubdtype(array.dtype, np.number)
+        and not np.issubdtype(array.dtype, np.complexfloating)
+        for array in (ix, iy, z, voxel_raw)
+    ):
+        return None
+
+    try:
+        ix_float = ix.astype(np.float64, copy=False)
+        iy_float = iy.astype(np.float64, copy=False)
+        z_float = z.astype(np.float64, copy=False)
+        voxel_size = float(voxel_raw.reshape(-1)[0])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not np.isfinite(ix_float).all()
+        or not np.isfinite(iy_float).all()
+        or not np.isfinite(z_float).all()
+        or not math.isfinite(voxel_size)
+        or voxel_size <= 0.0
+    ):
+        return None
+    if not np.equal(ix_float, np.trunc(ix_float)).all():
+        return None
+    if not np.equal(iy_float, np.trunc(iy_float)).all():
+        return None
+
+    index_limit = float(np.iinfo(np.int32).max)
+    index_minimum = float(np.iinfo(np.int32).min)
+    if (
+        (ix_float < index_minimum).any()
+        or (ix_float > index_limit).any()
+        or (iy_float < index_minimum).any()
+        or (iy_float > index_limit).any()
+    ):
+        return None
+
+    grid: dict[tuple[int, int], float] = {}
+    for raw_ix, raw_iy, raw_z in zip(ix_float, iy_float, z_float):
+        key = (int(raw_ix), int(raw_iy))
+        height = float(raw_z)
+        previous_height = grid.get(key)
+        if previous_height is None or height > previous_height:
+            grid[key] = height
+    return grid, voxel_size
+
+
+def _atomic_save_terrain_map(
+    path: str,
+    grid: dict[tuple[int, int], float],
+    voxel_size: float,
+) -> None:
+    """Atomically save a validated non-empty terrain grid."""
+
+    import os
+    import tempfile
+
+    import numpy as np
+
+    if not grid:
+        raise ValueError("refusing to save an empty terrain map")
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    ordered = sorted(grid)
+    ix = np.asarray([key[0] for key in ordered], dtype=np.int32)
+    iy = np.asarray([key[1] for key in ordered], dtype=np.int32)
+    z = np.asarray([grid[key] for key in ordered], dtype=np.float32)
+
+    temporary_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".terrain-map-",
+            suffix=".npz",
+            dir=parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+        np.savez_compressed(
+            temporary_path,
+            ix=ix,
+            iy=iy,
+            z=z,
+            voxel_size=np.float32(voxel_size),
+        )
+        if _load_valid_terrain_map(temporary_path) is None:
+            raise ValueError("generated terrain map failed validation")
+        with open(temporary_path, "r+b") as temporary:
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = ""
+    finally:
+        if temporary_path:
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+
+
+def _merge_session_terrain_map(
+    session_path: str,
+    canonical_path: str,
+    *,
+    canonical_existed_at_start: bool,
+) -> bool:
+    """Merge a stopped session's terrain into the canonical durable seed.
+
+    Existing canonical voxels are always retained, and duplicate keys keep the
+    maximum ``z``.  If ``/clear_memory`` removed a seed that existed when this
+    session started, the missing file is an explicit forget signal and must not
+    be resurrected from the bridge's later autosave.
+    """
+
+    import math
+    import os
+
+    if canonical_existed_at_start and not os.path.isfile(canonical_path):
+        logger.info(
+            "[sim_tool] canonical terrain seed was removed during the "
+            "session; skipping terrain persistence"
+        )
+        return False
+
+    session_map = _load_valid_terrain_map(session_path)
+    if session_map is None:
+        if os.path.exists(session_path):
+            logger.warning(
+                "[sim_tool] refusing to persist invalid session terrain map: %s",
+                session_path,
+            )
+        return False
+    session_grid, session_voxel_size = session_map
+
+    canonical_grid: dict[tuple[int, int], float] = {}
+    voxel_size = session_voxel_size
+    if os.path.isfile(canonical_path):
+        canonical_map = _load_valid_terrain_map(canonical_path)
+        if canonical_map is None:
+            logger.warning(
+                "[sim_tool] refusing to overwrite invalid canonical terrain "
+                "map: %s",
+                canonical_path,
+            )
+            return False
+        canonical_grid, canonical_voxel_size = canonical_map
+        if not math.isclose(
+            canonical_voxel_size,
+            session_voxel_size,
+            rel_tol=1e-7,
+            abs_tol=1e-9,
+        ):
+            logger.warning(
+                "[sim_tool] terrain voxel-size mismatch (session %.9g, "
+                "canonical %.9g); keeping canonical map unchanged",
+                session_voxel_size,
+                canonical_voxel_size,
+            )
+            return False
+        voxel_size = canonical_voxel_size
+
+    merged = dict(canonical_grid)
+    for key, height in session_grid.items():
+        previous_height = merged.get(key)
+        if previous_height is None or height > previous_height:
+            merged[key] = height
+    if len(merged) < len(canonical_grid):
+        raise AssertionError("terrain union must never shrink canonical data")
+
+    try:
+        _atomic_save_terrain_map(canonical_path, merged, voxel_size)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "[sim_tool] could not atomically persist terrain map to %s: %s",
+            canonical_path,
+            exc,
+        )
+        return False
+    return True
+
+
+class _VNavSessionLifecycle:
+    """Idempotent two-phase teardown for a managed navigation session."""
+
+    def __init__(
+        self,
+        *,
+        process: Any,
+        log_fh: Any,
+        session_dir: str,
+        session_values: dict[str, str],
+        previous_environment: dict[str, str | None],
+        canonical_terrain_path: str,
+        canonical_terrain_existed_at_start: bool,
+    ) -> None:
+        self._process = process
+        self._log_fh = log_fh
+        self._session_dir = session_dir
+        self._session_values = session_values
+        self._previous_environment = previous_environment
+        self._canonical_terrain_path = canonical_terrain_path
+        self._canonical_terrain_existed_at_start = (
+            canonical_terrain_existed_at_start
+        )
+        self._process_stopped = False
+        self._session_finalized = False
+
+    def stop_process(self) -> None:
+        """Stop the child process group and close its log, exactly once."""
+
+        import os
+        import signal
+        import time
+
+        if self._process_stopped:
+            return
+
+        group_id = self._process.pid
+        try:
+            os.killpg(group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            logger.debug("[sim_tool] failed to TERM vnav group", exc_info=True)
+
+        leader_reaped = False
+        try:
+            self._process.wait(timeout=5)
+            leader_reaped = True
+        except Exception:
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except Exception:
+                logger.debug(
+                    "[sim_tool] failed to KILL vnav group after TERM timeout",
+                    exc_info=True,
+                )
+            # SIGKILL does not reap the Popen child.  Waiting again is required
+            # or the long-lived CLI retains a zombie until garbage collection.
+            try:
+                self._process.wait(timeout=2)
+                leader_reaped = True
+            except Exception:
+                logger.warning(
+                    "[sim_tool] vnav launcher could not be reaped after SIGKILL",
+                    exc_info=True,
+                )
+
+        def _group_is_alive() -> bool:
+            try:
+                os.killpg(group_id, 0)
+            except ProcessLookupError:
+                return False
+            except Exception:
+                # Permission/OS errors mean disappearance cannot be proved.
+                logger.debug(
+                    "[sim_tool] could not inspect vnav process group",
+                    exc_info=True,
+                )
+                return True
+            return True
+
+        group_alive = _group_is_alive()
+        if group_alive:
+            # The launcher may exit before one of its descendants.  Kill the
+            # otherwise leaderless process group and wait briefly until the
+            # kernel confirms that no member remains.
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except Exception:
+                logger.debug(
+                    "[sim_tool] failed to KILL surviving vnav descendants",
+                    exc_info=True,
+                )
+            for _ in range(20):
+                if not _group_is_alive():
+                    group_alive = False
+                    break
+                time.sleep(0.05)
+            else:
+                group_alive = True
+
+        try:
+            self._log_fh.close()
+        except Exception:
+            pass
+        # Successful calls are strictly idempotent.  If either the direct child
+        # was not reaped or its process group still exists, leave the flag clear
+        # so a subsequent cleanup/finalizer call gets one bounded retry.
+        self._process_stopped = leader_reaped and not group_alive
+        if not self._process_stopped:
+            logger.warning(
+                "[sim_tool] vnav process teardown incomplete "
+                "(leader_reaped=%s, group_alive=%s)",
+                leader_reaped,
+                group_alive,
+            )
+
+    def finalize_session(self) -> None:
+        """Persist terrain, restore the parent env, and delete session state."""
+
+        import os
+        import shutil
+
+        if self._session_finalized:
+            return
+        # A direct finalizer call remains safe; normal shutdown deliberately
+        # invokes stop_process(), disconnects proxies with the session env still
+        # installed, then invokes this method.
+        self.stop_process()
+        try:
+            _merge_session_terrain_map(
+                self._session_values["VECTOR_TERRAIN_MAP_FILE"],
+                self._canonical_terrain_path,
+                canonical_existed_at_start=(
+                    self._canonical_terrain_existed_at_start
+                )
+            )
+        finally:
+            # A persistence error must not strand a stale ROS domain or session
+            # flag in the long-lived CLI process.
+            _restore_vnav_session_environment(
+                self._session_values,
+                self._previous_environment,
+            )
+            for key in _VNAV_SESSION_PATH_KEYS:
+                try:
+                    os.remove(self._session_values[key])
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.debug(
+                        "[sim_tool] failed to remove session file %s",
+                        self._session_values[key],
+                        exc_info=True,
+                    )
+            shutil.rmtree(self._session_dir, ignore_errors=True)
+            self._session_finalized = True
+
+    def cleanup(self) -> None:
+        """Compatibility wrapper for callers that need one-step teardown."""
+
+        self.stop_process()
+        self.finalize_session()
+
+
+def _wait_for_vnav_ready_marker(
+    process: Any,
+    log_fh: Any,
+    log_path: str,
+    *,
+    timeout_s: float = 90.0,
+    poll_s: float = 0.2,
+) -> None:
+    """Wait for the launcher's truthful Ready marker or fail with its log."""
+
+    import time
+
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    offset = 0
+    carry = ""
+    while True:
+        error = _vnav_process_exit_error(
+            process, log_fh, log_path, phase="launcher readiness"
+        )
+        if error is not None:
+            raise error
+        try:
+            log_fh.flush()
+        except Exception:
+            pass
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as stream:
+                stream.seek(offset)
+                chunk = stream.read()
+                offset = stream.tell()
+                candidate = carry + chunk
+                if _VNAV_READY_MARKER in candidate:
+                    return
+                carry = candidate[-len(_VNAV_READY_MARKER) :]
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            excerpt = _startup_log_excerpt(log_path)
+            detail = f" Diagnostic: {excerpt}" if excerpt else ""
+            raise TimeoutError(
+                "Go2 navigation launcher did not report Ready before "
+                f"{timeout_s:.1f}s.{detail} Full log: {log_path}"
+            )
+        time.sleep(max(0.01, float(poll_s)))
+
+
+def _endpoint_match_count(endpoint: Any, method_name: str) -> int:
+    if endpoint is None:
+        return 0
+    method = getattr(endpoint, method_name, None)
+    if not callable(method):
+        return 0
+    try:
+        return int(method())
+    except Exception:
+        return 0
+
+
+def _node_publisher_count(node: Any, topic: str) -> int:
+    method = getattr(node, "count_publishers", None)
+    if not callable(method):
+        return 0
+    try:
+        return int(method(topic))
+    except Exception:
+        return 0
+
+
+def _go2_navigation_readiness_missing(base: Any) -> tuple[str, ...]:
+    """Return missing endpoints and planner-data readiness for a Go2 proxy."""
+
+    missing: list[str] = []
+    if not bool(getattr(base, "_connected", False)):
+        missing.append("ROS proxy connection")
+    if getattr(base, "_last_odom", None) is None:
+        missing.append("/state_estimation odometry")
+
+    node = getattr(base, "_node", None)
+    if node is None:
+        missing.append("go2_agent_proxy node")
+        return tuple(missing)
+
+    publisher_requirements = (
+        ("_goal_control_pub", "/vector_os/nav_goal_control bridge subscriber"),
+        (
+            "_segment_control_pub",
+            "/vector_os/nav_segment_control bridge subscriber",
+        ),
+        ("_goal_pub", "/goal_point FAR subscriber"),
+        ("_waypoint_pub", "/way_point localPlanner subscriber"),
+    )
+    for attribute, label in publisher_requirements:
+        if (
+            _endpoint_match_count(
+                getattr(base, attribute, None), "get_subscription_count"
+            )
+            < 1
+        ):
+            missing.append(label)
+
+    ack_subscription = getattr(base, "_segment_ack_subscription", None)
+    ack_publishers = _endpoint_match_count(
+        ack_subscription, "get_publisher_count"
+    )
+    if ack_publishers < 1:
+        ack_publishers = _node_publisher_count(
+            node, "/vector_os/nav_segment_ack"
+        )
+    if ack_publishers < 1:
+        missing.append("/vector_os/nav_segment_ack bridge publisher")
+
+    topic_publishers = (
+        (
+            "/vector_os/nav_goal_telemetry",
+            "/vector_os/nav_goal_telemetry bridge publisher",
+        ),
+        ("/path", "/path localPlanner publisher"),
+    )
+    for topic, label in topic_publishers:
+        if _node_publisher_count(node, topic) < 1:
+            missing.append(label)
+
+    get_node_names = getattr(node, "get_node_names", None)
+    if callable(get_node_names):
+        try:
+            node_names = {
+                str(name).strip().lstrip("/") for name in get_node_names()
+            }
+        except Exception:
+            node_names = set()
+    else:
+        node_names = set()
+    for required_name in sorted(_GO2_REQUIRED_NAV_NODES - node_names):
+        missing.append(f"ROS node {required_name}")
+    for aliases in _GO2_REQUIRED_NAV_NODE_ALIASES:
+        if node_names.isdisjoint(aliases):
+            missing.append(f"ROS node {'/'.join(sorted(aliases))}")
+
+    # FAR advertises its topics before it can accept a goal.  Its callback
+    # explicitly drops /goal_point while is_graph_init_ is false, so endpoint
+    # discovery alone is not a product readiness contract.
+    vgraph_ready = getattr(base, "far_vgraph_ready", None)
+    if not callable(vgraph_ready):
+        missing.append("FAR non-empty V-Graph readiness signal")
+    else:
+        try:
+            ready = bool(vgraph_ready())
+        except Exception:
+            ready = False
+        if not ready:
+            diagnostics_reader = getattr(base, "far_vgraph_diagnostics", None)
+            diagnostics: dict[str, Any] = {}
+            if callable(diagnostics_reader):
+                try:
+                    candidate = diagnostics_reader()
+                    if isinstance(candidate, dict):
+                        diagnostics = candidate
+                except Exception:
+                    pass
+            status = str(diagnostics.get("status") or "not_ready")
+            node_count = int(diagnostics.get("node_count") or 0)
+            missing.append(
+                "FAR non-empty V-Graph "
+                f"(status={status}, global_vertex_nodes={node_count})"
+            )
+
+    return tuple(missing)
+
+
+def _wait_for_go2_navigation_ready(
+    base: Any,
+    *,
+    timeout_s: float = 35.0,
+    stable_s: float = 0.75,
+    poll_s: float = 0.1,
+    liveness_check: Any = None,
+) -> None:
+    """Require endpoints and a non-empty FAR graph to remain stably ready."""
+
+    import time
+
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    stable_since: float | None = None
+    last_missing: tuple[str, ...] = ()
+    while True:
+        if callable(liveness_check):
+            liveness_check()
+        now = time.monotonic()
+        last_missing = _go2_navigation_readiness_missing(base)
+        if not last_missing:
+            if stable_since is None:
+                stable_since = now
+            if now - stable_since >= max(0.0, float(stable_s)):
+                return
+        else:
+            stable_since = None
+        if now >= deadline:
+            detail = ", ".join(last_missing) or "DDS graph never stabilized"
+            raise TimeoutError(
+                "Go2 navigation control plane was not ready before "
+                f"{timeout_s:.1f}s; missing: {detail}"
+            )
+        time.sleep(max(0.01, float(poll_s)))
+
+
+def _odometry_sample_token(base: Any) -> tuple[Any, ...] | None:
+    """Extract a changing identity from the latest odometry message."""
+
+    message = getattr(base, "_last_odom", None)
+    if message is None:
+        return None
+    stamp = getattr(getattr(message, "header", None), "stamp", None)
+    return (
+        getattr(stamp, "sec", None),
+        getattr(stamp, "nanosec", None),
+        id(message),
+    )
+
+
+def _measure_go2_odometry_rate(
+    base: Any,
+    *,
+    window_s: float = 1.2,
+    poll_s: float = 0.02,
+    clock: Any = None,
+    sleep: Any = None,
+    liveness_check: Any = None,
+) -> float:
+    """Measure fresh odometry transitions over a bounded startup window."""
+
+    import time
+
+    now_fn = clock or time.monotonic
+    sleep_fn = sleep or time.sleep
+    window = max(0.1, float(window_s))
+    start = now_fn()
+    deadline = start + window
+    previous_token = _odometry_sample_token(base)
+    transitions = 0
+    while now_fn() < deadline:
+        if callable(liveness_check):
+            liveness_check()
+        remaining = deadline - now_fn()
+        sleep_fn(min(max(0.005, float(poll_s)), max(0.0, remaining)))
+        token = _odometry_sample_token(base)
+        if token is not None and token != previous_token:
+            transitions += 1
+        previous_token = token
+    elapsed = max(1e-6, now_fn() - start)
+    return transitions / elapsed
+
+
+def _require_go2_odometry_performance(
+    base: Any,
+    *,
+    minimum_hz: float = 5.0,
+    window_s: float = 1.2,
+    liveness_check: Any = None,
+) -> float:
+    """Reject a discovered but overloaded simulation before its first goal."""
+
+    measured_hz = _measure_go2_odometry_rate(
+        base,
+        window_s=window_s,
+        liveness_check=liveness_check,
+    )
+    if measured_hz < float(minimum_hz):
+        raise RuntimeError(
+            "Go2 startup_performance failed: /state_estimation updated at "
+            f"{measured_hz:.1f} Hz over {window_s:.1f}s; required at least "
+            f"{minimum_hz:.1f} Hz before navigation"
+        )
+    return measured_hz
+
+
+def _startup_log_excerpt(log_path: str, *, max_lines: int = 8) -> str:
+    """Return a compact startup diagnostic suitable for the native CLI."""
+
+    diagnostic_tokens = (
+        "traceback",
+        "error",
+        "exception",
+        "failed",
+        "unboundlocalerror",
+        "segmentation",
+        "core dumped",
+        "aborted",
+    )
+    diagnostics: list[str] = []
+    fallback: list[str] = []
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as stream:
+            for raw_line in stream:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                line = line[-300:]
+                fallback.append(line)
+                if len(fallback) > max_lines:
+                    fallback.pop(0)
+                lowered = line.lower()
+                if any(token in lowered for token in diagnostic_tokens):
+                    diagnostics.append(line)
+                    if len(diagnostics) > max_lines:
+                        diagnostics.pop(0)
+    except OSError:
+        return ""
+    return " | ".join(diagnostics or fallback)
+
+
+def _vnav_process_exit_error(
+    process: Any,
+    log_fh: Any,
+    log_path: str,
+    *,
+    phase: str,
+) -> RuntimeError | None:
+    """Build a fail-loud error when the navigation subprocess has died."""
+
+    return_code = process.poll()
+    if return_code is None:
+        return None
+    try:
+        log_fh.flush()
+    except Exception:
+        pass
+    excerpt = _startup_log_excerpt(log_path)
+    detail = f" Diagnostic: {excerpt}" if excerpt else ""
+    return RuntimeError(
+        f"Go2 navigation stack exited during {phase} "
+        f"(status {return_code}).{detail} Full log: {log_path}"
+    )
+
+
+def _require_go2_proxy_ready(base: Any) -> None:
+    """Require a live ROS connection and real bridge odometry."""
+
+    if not bool(getattr(base, "_connected", False)):
+        raise ConnectionError("Go2 ROS2 proxy did not connect")
+    if getattr(base, "_last_odom", None) is None:
+        raise TimeoutError(
+            "Go2 bridge published no /state_estimation odometry during startup"
+        )
+
+
+def _require_piper_proxy_ready(arm: Any, gripper: Any) -> None:
+    """Require the requested Piper embodiment to have real bridge state."""
+
+    if not bool(getattr(arm, "_connected", False)):
+        raise ConnectionError("Piper arm ROS2 proxy did not connect")
+    if float(getattr(arm, "_last_joint_state_ts", 0.0)) <= 0.0:
+        raise TimeoutError(
+            "Piper bridge published no /piper/joint_state during startup"
+        )
+    if not bool(getattr(gripper, "_connected", False)):
+        raise ConnectionError("Piper gripper ROS2 proxy did not connect")
+
+
+def _attach_sim_scene_graph(agent: Any, base: Any, repo: str) -> Any:
+    """Attach the mode-correct SceneGraph to a simulated mobile agent.
+
+    Known-layout simulation gets room-layout priors immediately, so a fresh bare
+    CLI can navigate by room name without first running ``explore``. Unknown-world
+    exploration uses a separate persistence file and never imports those priors.
+    """
+
+    import os
+
+    from vector_os_nano.core.scene_graph import SceneGraph
+    from vector_os_nano.navigation.world_mode import WorldMode, world_mode_for_agent
+
+    mode = world_mode_for_agent(agent)
+    filename = (
+        "scene_graph.yaml"
+        if mode is WorldMode.KNOWN_LAYOUT
+        else "scene_graph_unknown_exploration.yaml"
+    )
+    persist_path = os.path.expanduser(f"~/.vector_os_nano/{filename}")
+    os.makedirs(os.path.dirname(persist_path), exist_ok=True)
+    scene_graph = SceneGraph(persist_path=persist_path)
+    scene_graph.load()
+
+    if mode is WorldMode.KNOWN_LAYOUT:
+        layout_path = os.path.join(repo, "config", "room_layout.yaml")
+        # The simulated house geometry is deterministic. Correct stale persisted
+        # centres/doors on every startup while retaining learned objects, room
+        # descriptions, connections, and visit history.
+        scene_graph.load_layout(layout_path, overwrite=True)
+        scene_graph.save()
+
+    agent._spatial_memory = scene_graph
+    agent._world_mode = mode.value
+    config = getattr(agent, "_config", None)
+    if isinstance(config, dict):
+        config["world_mode"] = mode.value
+    base._scene_graph = scene_graph
+
+    stats = scene_graph.stats()
+    logger.info(
+        "[SceneGraph] mode=%s rooms=%d objects=%d persistence=%s",
+        mode.value,
+        stats["rooms"],
+        stats["objects"],
+        persist_path,
+    )
+    return scene_graph
+
+
+def _run_vnav_startup_stage(operation: Any, teardown: Any) -> Any:
+    """Run one managed-startup stage and roll back on every throwable exit.
+
+    ``SimStartTool.execute`` converts ordinary startup exceptions into a
+    ``ToolResult`` and keeps the CLI process alive, so relying on atexit here
+    would strand the ROS context and child stack.  KeyboardInterrupt and
+    SystemExit need the same rollback before they propagate.
+    """
+
+    try:
+        return operation()
+    except BaseException:
+        try:
+            teardown()
+        except BaseException:
+            logger.warning(
+                "[sim_tool] managed startup rollback failed",
+                exc_info=True,
+            )
+        raise
+
+
+def _finish_go2_startup(
+    *,
+    repo: str,
+    base: Any,
+    with_arm: bool,
+    startup_proxies: list[Any],
+    abort_startup: Any,
+    assert_stack_running: Any,
+) -> Any:
+    """Build the Go2 agent after transport readiness has been established."""
+
+    import os
+
+    # Load config for API key
+    from vector_os_nano.core.config import load_config
+
+    cfg_path = os.path.join(repo, "config", "user.yaml")
+    cfg = load_config(cfg_path) if os.path.exists(cfg_path) else {}
+    api_key = cfg.get("llm", {}).get("api_key") or os.environ.get(
+        "OPENROUTER_API_KEY", ""
+    )
+
+    # Piper arm + gripper proxies — bridge advertises /piper/* topics
+    # when VECTOR_SIM_WITH_ARM=1 was set in child_env above.
+    piper_arm = None
+    piper_gripper = None
+    piper_setup_error: Exception | None = None
+    if with_arm:
+        try:
+            from vector_os_nano.hardware.sim.mujoco_go2 import (
+                _build_room_scene_xml,
+            )
+
+            scene_xml = str(_build_room_scene_xml(with_arm=True))
+
+            from vector_os_nano.hardware.sim.piper_ros2_proxy import (
+                PiperGripperROS2Proxy,
+                PiperROS2Proxy,
+            )
+
+            piper_arm = PiperROS2Proxy(
+                base_proxy=base,
+                scene_xml_path=scene_xml,
+            )
+            startup_proxies.append(piper_arm)
+            piper_arm.connect()
+            piper_gripper = PiperGripperROS2Proxy(scene_xml_path=scene_xml)
+            startup_proxies.append(piper_gripper)
+            piper_gripper.connect()
+            _require_piper_proxy_ready(piper_arm, piper_gripper)
+            logger.info("[sim_tool] Piper proxies connected (arm + gripper)")
+        except ImportError as exc:
+            piper_setup_error = exc
+            logger.debug("[sim_tool] Piper proxy unavailable (no ROS2): %s", exc)
+            piper_arm = None
+            piper_gripper = None
+        except Exception as exc:
+            piper_setup_error = exc
+            logger.error("[sim_tool] Piper proxy setup failed: %s", exc)
+            for proxy in (piper_gripper, piper_arm):
+                if proxy is not None:
+                    try:
+                        proxy.disconnect()
+                    except Exception:
+                        pass
+            piper_arm = None
+            piper_gripper = None
+        if piper_arm is None or piper_gripper is None:
+            reason = (
+                f": {piper_setup_error}" if piper_setup_error is not None else ""
+            )
+            abort_startup(
+                f"Go2 + Piper was requested, but Piper did not become ready{reason}",
+                base_proxy=base,
+            )
+
+    from vector_os_nano.core.agent import Agent  # type: ignore[import]
+
+    agent = Agent(
+        base=base,
+        arm=piper_arm,
+        gripper=piper_gripper,
+        llm_api_key=api_key,
+        config=cfg,
+    )
+
+    # World model starts empty by design — objects are populated by the
+    # perception pipeline at runtime (DetectSkill / LookSkill), NOT by
+    # reading ground truth from the MJCF. This matches the SO-101 pattern:
+    # camera -> VLM/tracker -> 3D pose -> world_model.
+    #
+    # Escape hatch for offline demos only: set VECTOR_SIM_DEMO_GROUND_TRUTH=1
+    # to pre-populate from MJCF body names (treats sim as cheat knowledge).
+    if with_arm and os.environ.get("VECTOR_SIM_DEMO_GROUND_TRUTH") == "1":
+        try:
+            from vector_os_nano.hardware.sim.mujoco_go2 import (
+                _build_room_scene_xml,
+            )
+
+            scene_xml = str(_build_room_scene_xml(with_arm=True))
+            n = SimStartTool._populate_pickables_from_mjcf(
+                agent._world_model,
+                scene_xml,
+            )
+            logger.warning(
+                "[sim_tool] DEMO ground-truth populate: %d pickable objects "
+                "registered from MJCF (VECTOR_SIM_DEMO_GROUND_TRUTH=1). "
+                "This bypasses perception — use only for no-perception demos.",
+                n,
+            )
+        except Exception as exc:
+            logger.warning("[sim_tool] demo-populate failed: %s", exc)
+
+    # Go2 perception is sourced from the SysNav sibling workspace via the
+    # sysnav_bridge adapter (vector_os_nano/integrations/sysnav_bridge/).
+    # We do NOT instantiate an in-process VLM detector here; the bridge
+    # populates world_model when SysNav publishes /object_nodes_list.
+    # Until the bridge is wired (v2.4), agent._perception stays None and
+    # MobilePick returns object_not_found against an empty world_model.
+    agent._perception = None
+    agent._calibration = None
+
+    # Go2 skills
+    from vector_os_nano.skills.go2 import get_go2_skills  # type: ignore[import]
+
+    for skill in get_go2_skills():
+        agent._skill_registry.register(skill)
+    # Local manipulation (Piper pick/place) is wired whenever the user
+    # launched go2 WITH the arm — per the North Star, a capability behind a
+    # flag is NOT done, and `with_arm=True` is the user explicitly asking for
+    # the arm. Escape hatch to disable for a bare-mobility demo:
+    # VECTOR_ENABLE_MANIPULATION=0 (default ON for with_arm).
+    manipulation_on = os.environ.get("VECTOR_ENABLE_MANIPULATION", "1") != "0"
+    if piper_arm is not None and manipulation_on:
+        from vector_os_nano.skills.mobile_pick import MobilePickSkill
+        from vector_os_nano.skills.mobile_place import MobilePlaceSkill
+        from vector_os_nano.skills.pick_top_down import PickTopDownSkill
+        from vector_os_nano.skills.place_top_down import PlaceTopDownSkill
+
+        agent._skill_registry.register(PickTopDownSkill())
+        agent._skill_registry.register(PlaceTopDownSkill())
+        agent._skill_registry.register(MobilePickSkill())
+        agent._skill_registry.register(MobilePlaceSkill())
+        # Perception-driven grasp (the honest North-Star path): real RGB-D
+        # from the go2 d435 (bridge -> /camera/image + /camera/depth -> proxy)
+        # + Moondream VLM + EdgeTAM -> 3D grasp point (NOT ground truth).
+        # Registered LAST so it wins the shared 抓/grab aliases on the empty-
+        # world-model path (it needs no pre-populated world model; PickTopDown
+        # does). holding_object grades GROUNDED on this bare-cli path: the
+        # bridge welds the object on gripper-close and publishes per-body world
+        # xpos + per-weld active over /piper/object_state; the Piper proxies
+        # expose get_object_positions() + weld_is_active() + weld-backed
+        # is_holding() the verify oracle + actor_causation read (D36).
+        from vector_os_nano.perception.go2_grasp_perception import (
+            Go2GraspPerception,
+        )
+        from vector_os_nano.skills.perception_grasp import PerceptionGraspSkill
+
+        # Bridge publishes 320×240; intrinsics must match the actual frame size.
+        agent._perception = Go2GraspPerception(base, width=320, height=240)
+        agent._skill_registry.register(PerceptionGraspSkill())
+        logger.info(
+            "[sim_tool] perception-grasp wired: "
+            "Go2GraspPerception + PerceptionGraspSkill"
+        )
+
+    # VLM perception (GPT-4o via OpenRouter)
+    if api_key:
+        try:
+            from vector_os_nano.perception.vlm_go2 import Go2VLMPerception
+
+            agent._vlm = Go2VLMPerception(config={"api_key": api_key})
+        except Exception:
+            agent._vlm = None
+
+    # Mode-aware SceneGraph: known layout gets priors at startup; unknown
+    # exploration stays isolated and discovery-only.
+    _attach_sim_scene_graph(agent, base, repo)
+    assert_stack_running("final readiness")
+
+    return agent
+
 
 def locate_mjpython(executable: str | None = None) -> str | None:
     """Locate the ``mjpython`` launcher for the running environment.
@@ -223,10 +1362,37 @@ class SimStartTool:
         if sg_stats.get("rooms", 0) > 0:
             sg_info = f" SceneGraph restored: {sg_stats['rooms']} rooms."
 
-        hw_name = type(getattr(agent, "_arm", None) or getattr(agent, "_base", None)).__name__
+        base = getattr(agent, "_base", None)
+        runtime_info = ""
+        domain_id = getattr(base, "_sim_ros_domain_id", None)
+        log_path = getattr(base, "_sim_log_path", None)
+        startup_odom_hz = getattr(base, "_sim_startup_odom_hz", None)
+        startup_vgraph_nodes = getattr(
+            base, "_sim_startup_vgraph_nodes", None
+        )
+        if domain_id is not None and log_path:
+            rate_info = (
+                f", odom {float(startup_odom_hz):.1f} Hz"
+                if startup_odom_hz is not None
+                else ""
+            )
+            graph_info = (
+                f", FAR graph {int(startup_vgraph_nodes)} nodes"
+                if startup_vgraph_nodes is not None
+                else ""
+            )
+            runtime_info = (
+                f" ROS domain {domain_id}{rate_info}{graph_info}; "
+                f"log: {log_path}."
+            )
+
+        hw_name = type(getattr(agent, "_arm", None) or base).__name__
         skill_count = len(agent._skill_registry.list_skills()) if hasattr(agent, "_skill_registry") else 0
         return ToolResult(
-            content=f"Started {sim_type} simulation: {hw_name}, {skill_count} skills registered.{sg_info}"
+            content=(
+                f"Started {sim_type} simulation: {hw_name}, {skill_count} "
+                f"skills registered.{sg_info}{runtime_info}"
+            )
         )
 
     @staticmethod
@@ -240,11 +1406,42 @@ class SimStartTool:
         parts: list[str] = []
         base = getattr(agent, "_base", None)
         arm = getattr(agent, "_arm", None)
+        gripper = getattr(agent, "_gripper", None)
+        used_shared_runtime = any(
+            bool(getattr(proxy, "_shared_runtime_used", False))
+            for proxy in (base, arm, gripper)
+            if proxy is not None
+        )
+        sim_finalize_session = None
+        sim_unregister_cleanup = None
 
-        # Go2: kill launched subprocess group (nav stack + bridge + MuJoCo)
+        # Go2 phase 1: stop the child stack first, but deliberately leave the
+        # session environment installed until every ROS proxy has disconnected.
         if base is not None:
             proc = getattr(base, "_sim_subprocess", None)
-            if proc is not None and proc.poll() is None:
+            sim_stop_process = getattr(base, "_sim_stop_process", None)
+            sim_finalize_session = getattr(
+                base, "_sim_finalize_session", None
+            )
+            sim_unregister_cleanup = getattr(
+                base, "_sim_unregister_cleanup", None
+            )
+            sim_cleanup = getattr(base, "_sim_cleanup", None)
+            if callable(sim_stop_process):
+                try:
+                    sim_stop_process()
+                    parts.append("sim process tree stopped")
+                except Exception as exc:
+                    parts.append(f"sim process tree stop failed: {exc}")
+            elif callable(sim_cleanup):
+                # Compatibility with simulations created before the split
+                # lifecycle API.  Such cleanup may also restore its env.
+                try:
+                    sim_cleanup()
+                    parts.append("sim process tree stopped")
+                except Exception as exc:
+                    parts.append(f"sim process tree cleanup failed: {exc}")
+            elif proc is not None and proc.poll() is None:
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                     proc.wait(timeout=5)
@@ -268,7 +1465,6 @@ class SimStartTool:
                 pass
 
         # Arm + gripper (SO-101 arm-only sim, OR PiperROS2Proxy in go2-with-arm)
-        gripper = getattr(agent, "_gripper", None)
         if gripper is not None:
             try:
                 gripper.disconnect()
@@ -281,6 +1477,30 @@ class SimStartTool:
                 parts.append(f"{type(arm).__name__} disconnected")
             except Exception:
                 pass
+
+        if used_shared_runtime:
+            try:
+                from vector_os_nano.hardware.ros2.runtime import get_ros2_runtime
+
+                get_ros2_runtime().shutdown_if_idle()
+            except Exception:
+                pass
+
+        # Go2 phase 2: the proxy disconnect paths have finished resolving all
+        # session-scoped flags.  It is now safe to persist terrain, restore the
+        # parent environment, and delete the disposable session directory.
+        if callable(sim_finalize_session):
+            try:
+                sim_finalize_session()
+                parts.append("sim session finalized")
+            except Exception as exc:
+                parts.append(f"sim session finalization failed: {exc}")
+            finally:
+                if callable(sim_unregister_cleanup):
+                    try:
+                        sim_unregister_cleanup()
+                    except Exception:
+                        pass
 
         return "; ".join(parts) or "nothing to stop"
 
@@ -398,12 +1618,9 @@ class SimStartTool:
     @staticmethod
     def _start_go2(gui: bool = True, with_arm: bool = False) -> Any:
         import os
-        import signal
+        import shutil
         import subprocess
         import atexit
-        import time as _time
-        from vector_os_nano.core.agent import Agent  # type: ignore[import]
-        from vector_os_nano.core.config import load_config
 
         # Launch full stack as SEPARATE PROCESS (stable gait — no GIL contention)
         # This is the same architecture as run.py --sim-go2 --explore
@@ -412,183 +1629,260 @@ class SimStartTool:
         ))))
         # Use launch_explore.sh — all nodes (bridge + nav stack + TARE) must be
         # in ONE process group for reliable DDS communication. The nav flag
-        # (/tmp/vector_nav_active) is NOT created here — dog stays still.
+        # is NOT created here — dog stays still.
         # explore.py creates the flag to start movement.
         vnav_script = os.path.join(repo, "scripts", "launch_explore.sh")
         gui_flag = [] if gui else ["--no-gui"]
 
-        # Propagate mode to the sim subprocess via environment variable.
-        # MuJoCoGo2._build_room_scene_xml reads VECTOR_SIM_WITH_ARM to pick
-        # the scene (go2_piper vs bare go2). Subprocess inherits os.environ.
-        child_env = os.environ.copy()
-        child_env["VECTOR_SIM_WITH_ARM"] = "1" if with_arm else "0"
-
-        log_fh = open("/tmp/vector_vnav.log", "w")
-        vnav_proc = subprocess.Popen(
-            ["bash", vnav_script] + gui_flag,
-            stdout=log_fh, stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-            env=child_env,
+        # A generic ROS_DOMAIN_ID often leaks in from another sourced workspace.
+        # Deliberately ignore it and install a simulation-scoped domain before
+        # either the child stack or this process initialises rclpy.
+        domain_id = _select_sim_ros_domain_id()
+        canonical_terrain_path = _canonical_terrain_map_path()
+        canonical_terrain_existed_at_start = os.path.isfile(
+            canonical_terrain_path
+        )
+        session_dir, session_values, previous_environment = (
+            _prepare_vnav_session_environment(domain_id)
         )
 
-        def _cleanup():
+        # In shared-executor mode the runtime, not an individual proxy, owns the
+        # default rclpy context.  Bind it to this session's domain before any
+        # Node is constructed.  This is what makes SimStop -> SimStart on a new
+        # random domain safe inside one long-lived vector-cli process.
+        shared_runtime: Any = None
+        if os.environ.get("VECTOR_SHARED_EXECUTOR", "1") == "1":
             try:
-                os.killpg(os.getpgid(vnav_proc.pid), signal.SIGTERM)
-                vnav_proc.wait(timeout=5)
+                from vector_os_nano.hardware.ros2.runtime import (
+                    get_ros2_runtime,
+                )
+
+                shared_runtime = get_ros2_runtime()
+                shared_runtime.prepare_for_domain(domain_id)
             except Exception:
+                _restore_vnav_session_environment(
+                    session_values, previous_environment
+                )
+                shutil.rmtree(session_dir, ignore_errors=True)
+                raise
+
+        def _release_prepared_runtime_if_idle() -> None:
+            if shared_runtime is None:
+                return
+            try:
+                shared_runtime.shutdown_if_idle()
+            except Exception:
+                logger.debug(
+                    "[sim_tool] failed to release idle ROS2 runtime",
+                    exc_info=True,
+                )
+
+        # Propagate mode and ownership to the sim subprocess via environment.
+        # MuJoCoGo2._build_room_scene_xml reads VECTOR_SIM_WITH_ARM to pick
+        # the scene (go2_piper vs bare go2).  The parent watcher makes abnormal
+        # CLI exit terminate the complete launch session instead of orphaning it.
+        child_env = os.environ.copy()
+        child_env["VECTOR_SIM_WITH_ARM"] = "1" if with_arm else "0"
+        child_env["VECTOR_VNAV_PARENT_PID"] = str(os.getpid())
+        child_env["VECTOR_VNAV_MANAGED_SESSION"] = "1"
+
+        log_path = session_values["VECTOR_VNAV_LOG_FILE"]
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            log_fh = open(log_path, "w", buffering=1)
+        except Exception:
+            _release_prepared_runtime_if_idle()
+            _restore_vnav_session_environment(
+                session_values, previous_environment
+            )
+            shutil.rmtree(session_dir, ignore_errors=True)
+            raise
+        try:
+            vnav_proc = subprocess.Popen(
+                ["bash", vnav_script] + gui_flag,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=child_env,
+            )
+        except Exception:
+            log_fh.close()
+            _release_prepared_runtime_if_idle()
+            _restore_vnav_session_environment(
+                session_values, previous_environment
+            )
+            shutil.rmtree(session_dir, ignore_errors=True)
+            raise
+
+        lifecycle = _VNavSessionLifecycle(
+            process=vnav_proc,
+            log_fh=log_fh,
+            session_dir=session_dir,
+            session_values=session_values,
+            previous_environment=previous_environment,
+            canonical_terrain_path=canonical_terrain_path,
+            canonical_terrain_existed_at_start=(
+                canonical_terrain_existed_at_start
+            ),
+        )
+        _stop_process = lifecycle.stop_process
+        _finalize_session = lifecycle.finalize_session
+        _cleanup = lifecycle.cleanup
+        startup_proxies: list[Any] = []
+
+        try:
+            atexit.register(_cleanup)
+        except BaseException:
+            # The child already exists at this point, so even interpreter-level
+            # registration failures must not leave its process group running.
+            lifecycle.cleanup()
+            raise
+
+        def _forget_cleanup() -> None:
+            try:
+                atexit.unregister(_cleanup)
+            except Exception:
+                pass
+
+        def _teardown_failed_start() -> None:
+            """Tear down in dependency order while session paths remain active."""
+
+            _forget_cleanup()
+            try:
+                _stop_process()
+            except Exception:
+                logger.debug(
+                    "[sim_tool] failed to stop a rejected startup",
+                    exc_info=True,
+                )
+            for proxy in reversed(startup_proxies):
                 try:
-                    os.killpg(os.getpgid(vnav_proc.pid), signal.SIGKILL)
+                    proxy.disconnect()
                 except Exception:
                     pass
-            log_fh.close()
-
-        atexit.register(_cleanup)
-
-        # Wait for MuJoCo + bridge + nav stack to initialize
-        _time.sleep(20)
-
-        # Connect via ROS2 proxy (same as run.py --explore)
-        from vector_os_nano.hardware.sim.go2_ros2_proxy import Go2ROS2Proxy
-        base = Go2ROS2Proxy()
-        base.connect()
-        # Stash subprocess handles on the base so SimStopTool can clean up
-        # mid-session without waiting for atexit.
-        base._sim_subprocess = vnav_proc  # type: ignore[attr-defined]
-        base._sim_log_fh = log_fh         # type: ignore[attr-defined]
-
-        pos = base.get_position()
-        if pos == (0.0, 0.0, 0.28):
-            # Default position — wait more for odom
-            _time.sleep(5)
-            pos = base.get_position()
-
-        # Load config for API key
-        cfg_path = os.path.join(repo, "config", "user.yaml")
-        cfg = load_config(cfg_path) if os.path.exists(cfg_path) else {}
-        api_key = cfg.get("llm", {}).get("api_key") or os.environ.get("OPENROUTER_API_KEY", "")
-
-        # Piper arm + gripper proxies — bridge advertises /piper/* topics
-        # when VECTOR_SIM_WITH_ARM=1 was set in child_env above.
-        piper_arm = None
-        piper_gripper = None
-        if with_arm:
+            startup_proxies.clear()
+            _release_prepared_runtime_if_idle()
             try:
-                from vector_os_nano.hardware.sim.mujoco_go2 import _build_room_scene_xml
-                scene_xml = str(_build_room_scene_xml(with_arm=True))
-
-                from vector_os_nano.hardware.sim.piper_ros2_proxy import (
-                    PiperROS2Proxy, PiperGripperROS2Proxy,
-                )
-                piper_arm = PiperROS2Proxy(base_proxy=base, scene_xml_path=scene_xml)
-                piper_arm.connect()
-                piper_gripper = PiperGripperROS2Proxy(scene_xml_path=scene_xml)
-                piper_gripper.connect()
-                logger.info("[sim_tool] Piper proxies connected (arm + gripper)")
-            except ImportError as exc:
-                # ROS2/piper proxy deps unavailable (expected on a macOS/Windows
-                # sim host): run without the piper proxy, NOT an error.
-                logger.debug("[sim_tool] Piper proxy unavailable (no ROS2): %s", exc)
-                piper_arm = None
-                piper_gripper = None
-            except Exception as exc:
-                logger.error("[sim_tool] Piper proxy setup failed: %s", exc)
-                piper_arm = None
-                piper_gripper = None
-
-        agent = Agent(base=base, arm=piper_arm, gripper=piper_gripper,
-                      llm_api_key=api_key, config=cfg)
-
-        # World model starts empty by design — objects are populated by the
-        # perception pipeline at runtime (DetectSkill / LookSkill), NOT by
-        # reading ground truth from the MJCF. This matches the SO-101 pattern:
-        # camera -> VLM/tracker -> 3D pose -> world_model.
-        #
-        # Escape hatch for offline demos only: set VECTOR_SIM_DEMO_GROUND_TRUTH=1
-        # to pre-populate from MJCF body names (treats sim as cheat knowledge).
-        if with_arm and os.environ.get("VECTOR_SIM_DEMO_GROUND_TRUTH") == "1":
-            try:
-                from vector_os_nano.hardware.sim.mujoco_go2 import _build_room_scene_xml
-                scene_xml = str(_build_room_scene_xml(with_arm=True))
-                n = SimStartTool._populate_pickables_from_mjcf(agent._world_model, scene_xml)
-                logger.warning(
-                    "[sim_tool] DEMO ground-truth populate: %d pickable objects "
-                    "registered from MJCF (VECTOR_SIM_DEMO_GROUND_TRUTH=1). "
-                    "This bypasses perception — use only for no-perception demos.", n,
-                )
-            except Exception as exc:
-                logger.warning("[sim_tool] demo-populate failed: %s", exc)
-
-        # Go2 perception is sourced from the SysNav sibling workspace via the
-        # sysnav_bridge adapter (vector_os_nano/integrations/sysnav_bridge/).
-        # We do NOT instantiate an in-process VLM detector here; the bridge
-        # populates world_model when SysNav publishes /object_nodes_list.
-        # Until the bridge is wired (v2.4), agent._perception stays None and
-        # MobilePick returns object_not_found against an empty world_model.
-        agent._perception = None
-        agent._calibration = None
-
-        # Go2 skills
-        from vector_os_nano.skills.go2 import get_go2_skills  # type: ignore[import]
-        for skill in get_go2_skills():
-            agent._skill_registry.register(skill)
-        # Local manipulation (Piper pick/place) is wired whenever the user
-        # launched go2 WITH the arm — per the North Star, a capability behind a
-        # flag is NOT done, and `with_arm=True` is the user explicitly asking for
-        # the arm. Escape hatch to disable for a bare-mobility demo:
-        # VECTOR_ENABLE_MANIPULATION=0 (default ON for with_arm).
-        _manip_on = os.environ.get("VECTOR_ENABLE_MANIPULATION", "1") != "0"
-        if piper_arm is not None and _manip_on:
-            from vector_os_nano.skills.pick_top_down import PickTopDownSkill
-            from vector_os_nano.skills.place_top_down import PlaceTopDownSkill
-            from vector_os_nano.skills.mobile_pick import MobilePickSkill
-            from vector_os_nano.skills.mobile_place import MobilePlaceSkill
-            agent._skill_registry.register(PickTopDownSkill())
-            agent._skill_registry.register(PlaceTopDownSkill())
-            agent._skill_registry.register(MobilePickSkill())
-            agent._skill_registry.register(MobilePlaceSkill())
-            # Perception-driven grasp (the honest North-Star path): real RGB-D
-            # from the go2 d435 (bridge -> /camera/image + /camera/depth -> proxy)
-            # + Moondream VLM + EdgeTAM -> 3D grasp point (NOT ground truth).
-            # Registered LAST so it wins the shared 抓/grab aliases on the empty-
-            # world-model path (it needs no pre-populated world model; PickTopDown
-            # does). holding_object grades GROUNDED on this bare-cli path: the
-            # bridge welds the object on gripper-close and publishes per-body world
-            # xpos + per-weld active over /piper/object_state; the Piper proxies
-            # expose get_object_positions() + weld_is_active() + weld-backed
-            # is_holding() the verify oracle + actor_causation read (D36).
-            from vector_os_nano.perception.go2_grasp_perception import Go2GraspPerception
-            from vector_os_nano.skills.perception_grasp import PerceptionGraspSkill
-            # Bridge publishes 320×240; intrinsics must match the actual frame size.
-            agent._perception = Go2GraspPerception(base, width=320, height=240)
-            agent._skill_registry.register(PerceptionGraspSkill())
-            logger.info("[sim_tool] perception-grasp wired: Go2GraspPerception + PerceptionGraspSkill")
-
-        # VLM perception (GPT-4o via OpenRouter)
-        if api_key:
-            try:
-                from vector_os_nano.perception.vlm_go2 import Go2VLMPerception
-                agent._vlm = Go2VLMPerception(config={"api_key": api_key})
+                _finalize_session()
             except Exception:
-                agent._vlm = None
+                logger.warning(
+                    "[sim_tool] failed to finalize rejected startup",
+                    exc_info=True,
+                )
 
-        # Scene graph — persistent, also attach to proxy for RViz marker publishing
-        import os as _os
-        from vector_os_nano.core.scene_graph import SceneGraph
-        _persist_path = _os.path.expanduser("~/.vector_os_nano/scene_graph.yaml")
-        _os.makedirs(_os.path.dirname(_persist_path), exist_ok=True)
-        sg = SceneGraph(persist_path=_persist_path)
-        sg.load()
-        _stats = sg.stats()
-        if _stats["rooms"] > 0:
-            import logging as _logging
-            _logging.getLogger(__name__).info(
-                "[SceneGraph] restored %d rooms, %d objects from %s",
-                _stats["rooms"], _stats["objects"], _persist_path,
+        def _assert_stack_running(phase: str) -> None:
+            error = _vnav_process_exit_error(
+                vnav_proc, log_fh, log_path, phase=phase
             )
-        agent._spatial_memory = sg
-        base._scene_graph = agent._spatial_memory
+            if error is None:
+                return
+            raise error
 
-        return agent
+        def _abort_startup(message: str, *, base_proxy: Any = None) -> None:
+            try:
+                log_fh.flush()
+            except Exception:
+                pass
+            excerpt = _startup_log_excerpt(log_path)
+            if base_proxy is not None and all(
+                proxy is not base_proxy for proxy in startup_proxies
+            ):
+                startup_proxies.append(base_proxy)
+            detail = f" Diagnostic: {excerpt}" if excerpt else ""
+            raise RuntimeError(f"{message}.{detail} Full log: {log_path}")
+
+        def _complete_managed_startup() -> Any:
+            """Complete startup under one uninterrupted rollback boundary."""
+
+            # The launch marker is emitted only after every critical child
+            # remains alive.  It replaces the former fixed sleep, which could
+            # return too early on a loaded GUI host and waste time on a fast
+            # headless host.
+            _wait_for_vnav_ready_marker(
+                vnav_proc,
+                log_fh,
+                log_path,
+                timeout_s=90.0,
+            )
+            _assert_stack_running("launcher readiness")
+
+            # Connect via ROS2 proxy (same as run.py --explore).
+            from vector_os_nano.hardware.sim.go2_ros2_proxy import Go2ROS2Proxy
+
+            base = Go2ROS2Proxy()
+            startup_proxies.append(base)
+            base.connect()
+            _assert_stack_running("ROS2 proxy connection")
+
+            # Stash subprocess handles on the base so SimStopTool can clean up
+            # mid-session without waiting for atexit.
+            base._sim_subprocess = vnav_proc  # type: ignore[attr-defined]
+            base._sim_log_fh = log_fh  # type: ignore[attr-defined]
+            base._sim_stop_process = _stop_process  # type: ignore[attr-defined]
+            base._sim_finalize_session = (  # type: ignore[attr-defined]
+                _finalize_session
+            )
+            base._sim_cleanup = _cleanup  # type: ignore[attr-defined]
+            base._sim_unregister_cleanup = (  # type: ignore[attr-defined]
+                _forget_cleanup
+            )
+            base._sim_log_path = log_path  # type: ignore[attr-defined]
+            base._sim_session_dir = session_dir  # type: ignore[attr-defined]
+            base._sim_ros_domain_id = domain_id  # type: ignore[attr-defined]
+            base._sim_session_environment = (  # type: ignore[attr-defined]
+                dict(session_values)
+            )
+            base._sim_environment_previous = (  # type: ignore[attr-defined]
+                dict(previous_environment)
+            )
+
+            try:
+                _require_go2_proxy_ready(base)
+                _wait_for_go2_navigation_ready(
+                    base,
+                    timeout_s=35.0,
+                    stable_s=0.75,
+                    liveness_check=lambda: _assert_stack_running(
+                        "navigation/FAR graph readiness"
+                    ),
+                )
+                vgraph_diagnostics = base.far_vgraph_diagnostics()
+                base._sim_startup_vgraph_nodes = int(  # type: ignore[attr-defined]
+                    vgraph_diagnostics.get("node_count") or 0
+                )
+                odom_hz = _require_go2_odometry_performance(
+                    base,
+                    minimum_hz=5.0,
+                    window_s=1.2,
+                    liveness_check=lambda: _assert_stack_running(
+                        "odometry performance readiness"
+                    ),
+                )
+                base._sim_startup_odom_hz = odom_hz  # type: ignore[attr-defined]
+            except (ConnectionError, TimeoutError, RuntimeError) as exc:
+                _abort_startup(str(exc), base_proxy=base)
+
+            # Everything after transport readiness remains inside this startup
+            # transaction. A bad user config, Agent/skill import failure, scene
+            # graph error, or Ctrl+C must release the child stack, ROS
+            # nodes/context, and session environment immediately.
+            return _finish_go2_startup(
+                repo=repo,
+                base=base,
+                with_arm=with_arm,
+                startup_proxies=startup_proxies,
+                abort_startup=_abort_startup,
+                assert_stack_running=_assert_stack_running,
+            )
+
+        # SimStartTool.execute converts ordinary exceptions into a ToolResult
+        # while the CLI remains alive, so atexit alone is not a cleanup boundary.
+        # This one guard covers every operation from launcher readiness through
+        # the final Agent return, including KeyboardInterrupt/SystemExit.
+        return _run_vnav_startup_stage(
+            _complete_managed_startup,
+            _teardown_failed_start,
+        )
 
     @staticmethod
     def _start_isaac_go2() -> Any:
@@ -628,15 +1922,7 @@ class SimStartTool:
             except Exception:
                 agent._vlm = None
 
-        # Scene graph — persistent
-        import os as _os
-        from vector_os_nano.core.scene_graph import SceneGraph
-        _persist_path = _os.path.expanduser("~/.vector_os_nano/scene_graph.yaml")
-        _os.makedirs(_os.path.dirname(_persist_path), exist_ok=True)
-        sg = SceneGraph(persist_path=_persist_path)
-        sg.load()
-        agent._spatial_memory = sg
-        proxy._scene_graph = agent._spatial_memory
+        _attach_sim_scene_graph(agent, proxy, repo)
 
         return agent
 
@@ -724,14 +2010,7 @@ class SimStartTool:
             except Exception:
                 agent._vlm = None
 
-        # Scene graph — persistent
-        from vector_os_nano.core.scene_graph import SceneGraph
-        _persist_path = os.path.expanduser("~/.vector_os_nano/scene_graph.yaml")
-        os.makedirs(os.path.dirname(_persist_path), exist_ok=True)
-        sg = SceneGraph(persist_path=_persist_path)
-        sg.load()
-        agent._spatial_memory = sg
-        proxy._scene_graph = agent._spatial_memory
+        _attach_sim_scene_graph(agent, proxy, repo)
 
         return agent
 

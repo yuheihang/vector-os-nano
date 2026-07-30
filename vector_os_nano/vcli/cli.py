@@ -18,7 +18,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -27,6 +29,7 @@ import re
 
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -54,6 +57,11 @@ from vector_os_nano.vcli.permissions import PermissionContext
 from vector_os_nano.vcli.prompt import build_system_prompt
 from vector_os_nano.vcli.turn_status import TurnStatus
 from vector_os_nano.vcli.tools import CategorizedToolRegistry, ToolRegistry, discover_all_tools, discover_categorized_tools
+from vector_os_nano.navigation.runtime_files import (
+    DEFAULT_TERRAIN_MAP_FILE,
+    nav_reset_file,
+    terrain_map_file,
+)
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -295,7 +303,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-key", default=None, help="API key (or set ANTHROPIC_API_KEY / OPENROUTER_API_KEY)")
     parser.add_argument("--base-url", default=None, help="API base URL")
     parser.add_argument("--no-permission", action="store_true", help="Allow all tools without prompts")
-    parser.add_argument("--verbose", action="store_true", help="Debug logging")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Write Vector DEBUG diagnostics to the rotating CLI log while keeping "
+            "the interactive terminal concise"
+        ),
+    )
     parser.add_argument("--system-prompt", default=None, help="Path to custom system prompt file")
     parser.add_argument(
         "-p", "--print",
@@ -378,6 +393,54 @@ def _native_trace_acted(trace: Any) -> bool:
     """
     steps = getattr(trace, "steps", None) or ()
     return any((getattr(s, "strategy", "") or "").strip() for s in steps)
+
+
+def _compact_native_step_rows(
+    sub_goals: list[Any],
+    steps: list[Any],
+) -> list[tuple[str, str, bool, str, int]]:
+    """Collapse consecutive retries of the same action/post-condition for display."""
+
+    rows: list[tuple[str, str, bool, str, int]] = []
+    for index, step in enumerate(steps):
+        verify_expr = (
+            str(getattr(sub_goals[index], "verify", "") or "")
+            if index < len(sub_goals)
+            else ""
+        )
+        chain = (getattr(step, "strategy", "") or "").strip() or "(no action)"
+        ok = bool(getattr(step, "verify_result", False))
+        actor = getattr(getattr(step, "actor_caused", None), "value", "?")
+        if rows and rows[-1][0] == chain and rows[-1][1] == verify_expr:
+            rows[-1] = (chain, verify_expr, ok, actor, rows[-1][4] + 1)
+        else:
+            rows.append((chain, verify_expr, ok, actor, 1))
+    return rows
+
+
+def _log_native_failure_details(steps: list[Any]) -> None:
+    """Keep full native failure structures in the file log, never the Rich UI."""
+
+    for step in steps:
+        error = str(getattr(step, "error", "") or "")
+        result_data = getattr(step, "result_data", {}) or {}
+        diagnosis = (
+            str(result_data.get("diagnosis_code", "") or "")
+            if isinstance(result_data, dict)
+            else ""
+        )
+        if (
+            error
+            or diagnosis
+            or not bool(getattr(step, "success", False))
+            or not bool(getattr(step, "verify_result", False))
+        ):
+            logger.info(
+                "Native step failure detail: strategy=%s error=%s result_data=%r",
+                getattr(step, "strategy", "") or "(no action)",
+                error,
+                result_data,
+            )
 
 
 def _repl_native_enabled() -> bool:
@@ -486,22 +549,33 @@ def _repl_attempt_native(
 
     sub_goals = list(getattr(trace.goal_tree, "sub_goals", ()) or ())
     steps = list(getattr(trace, "steps", ()) or ())
+    _log_native_failure_details(steps)
     console.print()
-    for i, s in enumerate(steps):
-        verify_expr = sub_goals[i].verify if i < len(sub_goals) else ""
-        chain = (getattr(s, "strategy", "") or "").strip() or "(no action)"
-        ok = bool(getattr(s, "verify_result", False))
-        actor = getattr(getattr(s, "actor_caused", None), "value", "?")
+    for chain, verify_expr, ok, actor, attempts in _compact_native_step_rows(
+        sub_goals, steps,
+    ):
         mark = "[green]✓[/]" if ok else "[yellow]·[/]"
+        detail = (
+            f"{attempts} attempts, final actor={actor}"
+            if attempts > 1
+            else f"actor={actor}"
+        )
         console.print(
-            f"  [{TEAL}]▸[/] {chain} → verify {verify_expr} {mark} [dim](actor={actor})[/]"
+            f"  [{TEAL}]▸[/] {chain} → verify {verify_expr} {mark} "
+            f"[dim]({detail})[/]"
         )
 
     verified = False
+    compact_reason = ""
     try:
         oracle_names = verify_oracle_names(agent, engine)
         report = VerdictReport.from_trace(trace, oracle_names)
         verified = bool(report.verified)
+        compact_reason = report.compact_failure_reason()
+        if compact_reason:
+            console.print(
+                f"  [yellow]reason[/] {escape(compact_reason)}"
+            )
         color = "green" if verified else "yellow"
         console.print(
             f"  [{TEAL}]verdict[/] {report.evidence} "
@@ -520,7 +594,9 @@ def _repl_attempt_native(
         )
         session.append_user(user_input)
         session.append_assistant(
-            f"[native executed]\nGoal: {user_input}\nVerified: {verified}\n{summary}"
+            f"[native executed]\nGoal: {user_input}\nVerified: {verified}"
+            + (f"\nReason: {compact_reason}" if compact_reason else "")
+            + f"\n{summary}"
         )
     except Exception:  # noqa: BLE001 — session record is best-effort
         pass
@@ -786,22 +862,22 @@ def _init_agent(args: argparse.Namespace) -> Any:
                 agent._vlm = None
 
 
-        # Scene graph (SysNav-style) with persistence
-        import os as _os
-        from vector_os_nano.core.scene_graph import SceneGraph
-        _sg_path = _os.path.expanduser("~/.vector_os_nano/scene_graph.yaml")
-        _os.makedirs(_os.path.dirname(_sg_path), exist_ok=True)
-        _sg = SceneGraph(persist_path=_sg_path)
-        _sg.load()
+        # Mode-aware SceneGraph. known_layout is seeded immediately; the explicit
+        # unknown_exploration mode stays prior-free and uses separate persistence.
+        from vector_os_nano.vcli.tools.sim_tool import _attach_sim_scene_graph
+
+        _repo = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))
+        _sg = _attach_sim_scene_graph(agent, base, _repo)
         _sg_stats = _sg.stats()
         if _sg_stats["rooms"] > 0:
             console.print(
-                f"[dim]  Memory: scene graph restored "
+                f"[dim]  Memory: scene graph ready "
                 f"({_sg_stats['rooms']} rooms, {_sg_stats['objects']} objects)[/dim]"
             )
         else:
             console.print(f"[dim]  Memory: scene graph (rooms -> viewpoints -> objects)[/dim]")
-        agent._spatial_memory = _sg
 
         # ROS2 bridge + nav stack (background)
         try:
@@ -814,8 +890,7 @@ def _init_agent(args: argparse.Namespace) -> Any:
 
     except Exception as exc:
         console.print(f"[yellow]Warning: Could not init simulation: {exc}[/yellow]")
-        import traceback
-        traceback.print_exc()
+        logger.info("Simulation initialization failed", exc_info=True)
         return None
 
 
@@ -1147,6 +1222,7 @@ def _handle_slash_command(
     elif cmd == "clear_memory":
         import os as _os
         _sg_path = _os.path.expanduser("~/.vector_os_nano/scene_graph.yaml")
+        _persist_to_remove = _sg_path
         cleared = False
 
         # Clear in-memory scene graph if agent is running
@@ -1155,8 +1231,19 @@ def _handle_slash_command(
             sm = getattr(agent_obj, "_spatial_memory", None)
             if sm is not None:
                 persist_path = getattr(sm, "_persist_path", None) or _sg_path
+                _persist_to_remove = persist_path
                 from vector_os_nano.core.scene_graph import SceneGraph
                 new_sg = SceneGraph(persist_path=persist_path)
+                from vector_os_nano.navigation.world_mode import WorldMode, get_world_mode
+                mode = get_world_mode(getattr(agent_obj, "_world_mode", None))
+                if mode is WorldMode.KNOWN_LAYOUT:
+                    repo = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+                        _os.path.abspath(__file__)
+                    )))
+                    new_sg.load_layout(
+                        _os.path.join(repo, "config", "room_layout.yaml"),
+                        overwrite=False,
+                    )
                 agent_obj._spatial_memory = new_sg
                 base = getattr(agent_obj, "_base", None)
                 if base is not None and hasattr(base, "_scene_graph"):
@@ -1165,18 +1252,24 @@ def _handle_slash_command(
 
         # Always delete the persist file (works even without agent)
         try:
-            _os.remove(_sg_path)
+            _os.remove(_persist_to_remove)
             cleared = True
         except FileNotFoundError:
             pass
 
-        # Delete terrain map if present
-        _terrain_path = _os.path.expanduser("~/.vector_os_nano/terrain_map.npz")
-        try:
-            _os.remove(_terrain_path)
-            cleared = True
-        except FileNotFoundError:
-            pass
+        # Delete both the live session copy and its canonical seed.  Without
+        # removing the seed, a later SimStart would copy forgotten terrain back
+        # into a fresh session.
+        _terrain_paths = {
+            terrain_map_file(),
+            _os.path.abspath(_os.path.expanduser(DEFAULT_TERRAIN_MAP_FILE)),
+        }
+        for _terrain_path in _terrain_paths:
+            try:
+                _os.remove(_terrain_path)
+                cleared = True
+            except FileNotFoundError:
+                pass
 
         if cleared:
             console.print(f"[dim]  Scene graph cleared. All rooms/objects forgotten.[/dim]")
@@ -1187,7 +1280,7 @@ def _handle_slash_command(
         import os as _os
         # Signal bridge to reset robot pose via file flag
         try:
-            with open("/tmp/vector_reset_pose", "w") as _f:
+            with open(nav_reset_file(), "w") as _f:
                 _f.write("1")
             console.print(f"[dim]  Reset signal sent. Robot will stand up at current position.[/dim]")
         except OSError as _exc:
@@ -1434,9 +1527,9 @@ def _maybe_reexec_under_mjpython(args: argparse.Namespace) -> None:
     os.execve(mjpython, [mjpython, "-m", "vector_os_nano.vcli.cli"] + sys.argv[1:], new_env)
 
 
-# Loggers whose per-step INFO/WARNING lines are pure REPL noise on the non-verbose
-# console (the rich step UI already surfaces every failure).  Quieted to ERROR on
-# the non-verbose REPL; restored to NOTSET under --verbose.
+# Loggers whose INFO/WARNING lines are already represented by the Rich REPL.  They
+# remain enabled for the file handler; console quieting is handler-scoped so useful
+# diagnostics are never discarded.
 _QUIET_LOGGERS: tuple[str, ...] = (
     "vector_os_nano.vcli.cognitive",   # step-failure WARNINGs duplicated by rich UI
     "vector_os_nano.skills",           # [PICK]/[SCAN] INFO lines
@@ -1447,30 +1540,164 @@ _QUIET_LOGGERS: tuple[str, ...] = (
 # Back-compat alias used by the existing tests.
 _COGNITIVE_LOGGER = _QUIET_LOGGERS[0]
 
+_TRANSPORT_LOGGERS: tuple[str, ...] = (
+    "anthropic",
+    "httpcore",
+    "httpx",
+    "openai",
+    "urllib3",
+    "asyncio",
+    "OpenGL",
+)
+_CLI_LOG_ENV = "VECTOR_CLI_LOG_FILE"
+_CLI_LOG_MAX_BYTES = 5 * 1024 * 1024
+_CLI_LOG_BACKUPS = 3
+_ACTIVE_LOG_PATH: Path | None = None
 
-def _setup_logging(verbose: bool) -> None:
-    """Configure logging for the REPL entry path (CLI only).
 
-    --verbose -> root DEBUG; all noisy sub-package loggers restored to NOTSET so
-    they inherit the root level (full logging preserved).
+class _DynamicStderrHandler(logging.StreamHandler):
+    """A StreamHandler that follows the current ``sys.stderr``.
 
-    Non-verbose -> root WARNING; the sub-package loggers in _QUIET_LOGGERS are
-    pinned to ERROR so their INFO/WARNING lines don't flood the console.  Every
-    step failure is ALREADY surfaced in the rich step UI ("[FAIL] ..."); the
-    duplicate log lines are pure noise.  The quieting is scoped to those specific
-    package prefixes — NOT the root logger — so real ERRORs still surface and the
-    engine/kernel loggers are unaffected.  Library code and the test suite never
-    call this function; it is the CLI entry path only.
+    Rich temporarily redirects stderr while a live spinner owns the terminal.
+    The stock handler captures the original stream at construction time, so it
+    used to punch DEBUG lines through the spinner even during that redirect.
     """
-    if verbose:
-        logging.basicConfig(level=logging.DEBUG)
-        # Undo any prior non-verbose quieting so --verbose always restores full logging.
-        for name in _QUIET_LOGGERS:
-            logging.getLogger(name).setLevel(logging.NOTSET)
-    else:
-        logging.basicConfig(level=logging.WARNING)
-        for name in _QUIET_LOGGERS:
-            logging.getLogger(name).setLevel(logging.ERROR)
+
+    _vector_cli_owned = True
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.stream = sys.stderr
+        super().emit(record)
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """Keep every newly opened generation of the CLI log owner-only."""
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        stream = super()._open()
+        try:
+            Path(self.baseFilename).chmod(0o600)
+        except OSError:
+            pass
+        return stream
+
+
+def _remove_cli_handlers(root: logging.Logger) -> None:
+    """Remove handlers from an earlier CLI setup without closing foreign ones."""
+
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        if getattr(handler, "_vector_cli_owned", False):
+            try:
+                handler.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _open_cli_log_handler(
+    verbose: bool,
+    requested_path: str | os.PathLike[str] | None,
+) -> tuple[RotatingFileHandler | None, Path | None]:
+    """Create the private rotating log, falling back to ``/tmp`` if needed."""
+
+    configured = requested_path or os.environ.get(_CLI_LOG_ENV, "").strip()
+    candidates = (
+        [Path(configured).expanduser()]
+        if configured
+        else [
+            Path.home() / ".vector" / "logs" / "vector-cli.log",
+            Path(tempfile.gettempdir()) / "vector-cli.log",
+        ]
+    )
+    for path in candidates:
+        try:
+            parent_existed = path.parent.exists()
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # A newly created/default log directory is CLI-owned and private.
+            # Never chmod an arbitrary existing directory supplied by the user
+            # (notably the /tmp fallback).
+            managed_default_parent = (
+                not configured
+                and path.parent == Path.home() / ".vector" / "logs"
+            )
+            if not parent_existed or managed_default_parent:
+                try:
+                    path.parent.chmod(0o700)
+                except OSError:
+                    pass
+            handler = _PrivateRotatingFileHandler(
+                path,
+                maxBytes=_CLI_LOG_MAX_BYTES,
+                backupCount=_CLI_LOG_BACKUPS,
+                encoding="utf-8",
+                delay=True,
+            )
+            handler._vector_cli_owned = True  # type: ignore[attr-defined]
+            handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+            handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                    datefmt="%Y-%m-%dT%H:%M:%S",
+                )
+            )
+            # Create the delayed file now so permissions are deterministic.
+            handler.acquire()
+            try:
+                handler.stream = handler._open()
+            finally:
+                handler.release()
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return handler, path
+        except OSError:
+            continue
+    return None, None
+
+
+def _setup_logging(
+    verbose: bool,
+    *,
+    log_path: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    """Split machine diagnostics from the human-facing REPL.
+
+    The interactive terminal receives ERROR/CRITICAL only; Rich already renders
+    tool progress, failures, and the final verdict. Vector INFO is always retained
+    in a rotating file, and ``--verbose`` raises only that file to DEBUG. Extremely
+    chatty transport libraries remain at WARNING even in verbose mode so full
+    prompts, tool schemas, HTTP headers, and TLS state are not copied into routine
+    logs. This function is used only by the CLI entry path.
+    """
+
+    global _ACTIVE_LOG_PATH
+
+    root = logging.getLogger()
+    _remove_cli_handlers(root)
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    console_handler = _DynamicStderrHandler()
+    console_handler.setLevel(logging.ERROR)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    root.addHandler(console_handler)
+
+    file_handler, active_path = _open_cli_log_handler(verbose, log_path)
+    if file_handler is not None:
+        root.addHandler(file_handler)
+    _ACTIVE_LOG_PATH = active_path
+
+    # Old CLI invocations pinned project namespaces to ERROR. Always undo that so
+    # the file handler receives their diagnostics.
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+    # SDK wire-level DEBUG can include complete prompts, tool schemas and headers.
+    # Keep only actionable third-party warnings/errors in both destinations.
+    for name in _TRANSPORT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    return active_path
 
 
 def _ensure_sigint_under_mjpython() -> None:
@@ -1774,6 +2001,11 @@ def run_one_turn(args: Any) -> int:
             # The ONE machine line on real stdout (Rich/banner are on stderr).
             print(report.to_sentinel_line(), flush=True)
         else:
+            compact_reason = report.compact_failure_reason()
+            if compact_reason:
+                console.print(
+                    f"[yellow]reason[/] {escape(compact_reason)}"
+                )
             console.print(
                 f"[{TEAL}]verdict[/] {report.evidence} "
                 f"verified={report.verified} ({report.n_grounded}/{report.n_steps} grounded)"
@@ -2625,8 +2857,7 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     console.print(f"[red]Error:[/] {exc}")
                 if args.verbose:
-                    import traceback
-                    traceback.print_exc()
+                    logger.debug("REPL turn failed", exc_info=True)
 
     finally:
         session.save()

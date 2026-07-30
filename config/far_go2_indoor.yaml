@@ -51,7 +51,10 @@ far_planner:
     c_detector/img_folder_path: /path
 
     # Graph Planner Params
-    g_planner/converge_distance: 0.4  # Unit: meter
+    # Must be tighter than the strictest P2 door waypoint tolerance (0.22 m).
+    # A larger value makes FAR stop while the application is still waiting,
+    # producing a deterministic segment stall at door centres.
+    g_planner/converge_distance: 0.18  # Unit: meter
     g_planner/goal_adjust_radius: 1.0  # Unit: meter
     g_planner/free_counter_thred: 7
     g_planner/reach_goal_vote_size: 3

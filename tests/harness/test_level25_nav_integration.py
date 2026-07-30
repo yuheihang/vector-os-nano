@@ -83,14 +83,14 @@ def test_proxy_has_waypoint_publisher() -> None:
 
 
 def test_proxy_navigate_creates_nav_flag() -> None:
-    """navigate_to() references the /tmp/vector_nav_active flag file."""
+    """navigate_to() resolves and creates the session navigation flag."""
     src = _proxy_source()
-    assert "/tmp/vector_nav_active" in src, (
-        "navigate_to must create /tmp/vector_nav_active flag"
+    assert "nav_active_file" in src, (
+        "navigate_to must resolve the session navigation flag"
     )
     # Should also open/write the flag
-    assert re.search(r'open\(.*vector_nav_active', src), (
-        "navigate_to must open /tmp/vector_nav_active for writing"
+    assert re.search(r'open\(nav_active_file\(\)', src), (
+        "navigate_to must open the resolved navigation flag for writing"
     )
 
 
@@ -110,8 +110,8 @@ def test_proxy_has_stop_navigation() -> None:
     )
     src = _proxy_source()
     # stop_navigation must remove the flag (os.remove)
-    assert re.search(r'os\.remove.*vector_nav_active', src), (
-        "stop_navigation must call os.remove('/tmp/vector_nav_active')"
+    assert re.search(r'os\.remove\(nav_active_file\(\)\)', src), (
+        "stop_navigation must remove the resolved navigation flag"
     )
 
 
@@ -260,16 +260,18 @@ def test_arrival_threshold() -> None:
     if match:
         arrival_dist = float(match.group(1))
     else:
-        # Pattern 2 (current): _ARRIVAL_DIST = _nav("arrival_radius", 0.8)
-        # or _ARRIVAL = _nav("arrival_radius", 0.8)
+        # Pattern 2 (current): an explicit per-segment arrival_tolerance wins,
+        # otherwise the configured arrival_radius default is used.  The
+        # assignment is intentionally multiline, so match the configuration
+        # call rather than relying on one exact formatting shape.
         match = re.search(
-            r'_ARRIVAL(?:_DIST)?\s*=\s*_nav\s*\([^,]+,\s*([\d.]+)\)',
+            r'_nav\s*\(\s*["\']arrival_radius["\']\s*,\s*([\d.]+)\s*\)',
             src,
         )
         assert match is not None, (
-            "navigate_to must define _ARRIVAL_DIST or _ARRIVAL threshold "
-            "(literal or _nav() call)"
+            "navigate_to must define an arrival_radius default"
         )
+        assert "arrival_tolerance" in src
         arrival_dist = float(match.group(1))
     assert 0.5 <= arrival_dist <= 1.0, (
         f"arrival distance={arrival_dist} must be in [0.5, 1.0] m"
@@ -296,10 +298,10 @@ def test_navigate_skill_cancels_exploration_on_start() -> None:
 
 
 def test_navigate_skill_ensures_nav_flag() -> None:
-    """NavigateSkill.execute() ensures /tmp/vector_nav_active exists before navigating."""
+    """NavigateSkill.execute() ensures the session nav flag exists."""
     src = _navigate_skill_source()
-    assert "vector_nav_active" in src, (
-        "NavigateSkill must reference /tmp/vector_nav_active"
+    assert "nav_active_file" in src, (
+        "NavigateSkill must resolve the session nav flag"
     )
 
 

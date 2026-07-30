@@ -138,6 +138,8 @@ class Agent:
         # ---- Lazy-init state ------------------------------------------------
         self._ik_solver: Any = None
         self._calibration: Any = None
+        self._ik_init_attempted: bool = False
+        self._calibration_init_attempted: bool = False
 
         # ---- Sync world model with hardware ----------------------------------
         self._sync_robot_state()
@@ -152,12 +154,26 @@ class Agent:
             try:
                 joints = self._arm.get_joint_positions()
                 ee_pos = (0.0, 0.0, 0.0)
-                if self._ik_solver is not None:
+                # Each arm owns the kinematics for its own mechanism. Piper's
+                # 6-DoF MuJoCo FK must win over the optional SO-101 5-DoF
+                # Pinocchio solver; the latter is only a fallback for legacy
+                # externally-injected arms without an ``fk`` method.
+                arm_fk = getattr(self._arm, "fk", None)
+                fk = (
+                    arm_fk
+                    if callable(arm_fk)
+                    else getattr(self._ik_solver, "fk", None)
+                )
+                if callable(fk):
                     try:
-                        pos, _ = self._ik_solver.fk(joints)
-                        ee_pos = tuple(pos)
-                    except Exception:
-                        pass
+                        pos, _ = fk(joints)
+                        ee_pos = (
+                            float(pos[0]),
+                            float(pos[1]),
+                            float(pos[2]),
+                        )
+                    except Exception as exc:
+                        logger.debug("Arm FK unavailable: %s", exc)
                 self._world_model.update_robot_state(
                     joint_positions=tuple(joints),
                     ee_position=ee_pos,
@@ -344,19 +360,33 @@ class Agent:
         Returns:
             SkillContext bundling all resources skills need during execution.
         """
-        # Lazy-init IK solver
-        if self._ik_solver is None and self._arm is not None:
+        # Lazy-init the SO101-style external IK solver only for arms that expose
+        # its injection capability. Piper owns an internal MuJoCo IK model and
+        # must never load the SO101 URDF. Cache failures so every action does not
+        # repeat the same expensive import/construction attempt.
+        set_ik_solver = (
+            getattr(self._arm, "set_ik_solver", None)
+            if self._arm is not None
+            else None
+        )
+        if (
+            self._ik_solver is None
+            and callable(set_ik_solver)
+            and not self._ik_init_attempted
+        ):
+            self._ik_init_attempted = True
             try:
                 from vector_os_nano.hardware.so101.ik_solver import IKSolver  # lazy
 
                 self._ik_solver = IKSolver()
-                if hasattr(self._arm, "set_ik_solver"):
-                    self._arm.set_ik_solver(self._ik_solver)
+                set_ik_solver(self._ik_solver)
             except Exception as exc:
                 logger.debug("IK solver not available: %s", exc)
 
-        # Lazy-init calibration
-        if self._calibration is None:
+        # Calibration failure is likewise stable for the lifetime of this Agent;
+        # retry only after constructing a new agent/configuration.
+        if self._calibration is None and not self._calibration_init_attempted:
+            self._calibration_init_attempted = True
             try:
                 from pathlib import Path
 

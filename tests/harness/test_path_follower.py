@@ -58,11 +58,11 @@ def _compute_velocity(
 
     if abs_err < 0.6:
         vx = float(np.clip(0.5 * math.cos(err), 0.1, 0.5))
-        vy = float(np.clip(0.1 * math.sin(-err), -0.1, 0.1))
+        vy = float(np.clip(0.1 * math.sin(err), -0.1, 0.1))
         vyaw = float(np.clip(err * 0.6, -0.5, 0.5))
     elif abs_err < 2.0:
         vx = 0.0
-        vy = float(np.clip(0.08 * math.sin(-err), -0.08, 0.08))
+        vy = float(np.clip(0.08 * math.sin(err), -0.08, 0.08))
         vyaw = float(np.clip(err * 0.8, -0.6, 0.6))
     else:
         vx = 0.0

@@ -54,6 +54,188 @@ EXIT_VERIFIED = 0
 EXIT_ERROR = 1
 EXIT_RAN_NOT_VERIFIED = 2
 
+_DIAGNOSTIC_VALUE_MAX_CHARS = 96
+
+
+def _short_scalar(value: Any) -> str:
+    """Return one bounded, single-line scalar for a human-facing diagnostic."""
+
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float):
+            return f"{value:.3f}".rstrip("0").rstrip(".")
+        return str(value)
+    text = " ".join(str(value).split())
+    if len(text) > _DIAGNOSTIC_VALUE_MAX_CHARS:
+        return text[: _DIAGNOSTIC_VALUE_MAX_CHARS - 1] + "…"
+    return text
+
+
+def _short_value(value: Any) -> str:
+    """Format only the useful identity/position part of a structured value."""
+
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        label = _short_scalar(
+            value.get("label")
+            or value.get("name")
+            or value.get("room")
+            or ""
+        )
+        point = (
+            value.get("xy")
+            or value.get("position_xy")
+            or value.get("target_xy")
+            or value.get("position")
+        )
+        point_text = _short_value(point) if point is not None else ""
+        if label and point_text:
+            return f"{label}@{point_text}"
+        return label or point_text
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "[]"
+        if (
+            2 <= len(value) <= 3
+            and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool)
+                for item in value
+            )
+        ):
+            return f"({', '.join(_short_scalar(item) for item in value)})"
+        items = ", ".join(_short_scalar(item) for item in value[:4])
+        suffix = ", …" if len(value) > 4 else ""
+        return f"[{items}{suffix}]"
+    return _short_scalar(value)
+
+
+def _error_payload(step: Any) -> dict[str, Any]:
+    """Decode the native tool's JSON error without exposing its raw prose."""
+
+    raw = str(getattr(step, "error", "") or "").strip()
+    if not raw.startswith("{"):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _first_value(
+    payloads: tuple[dict[str, Any], ...],
+    keys: tuple[str, ...],
+) -> Any:
+    for payload in payloads:
+        for key in keys:
+            value = payload.get(key)
+            if value is not None and value != "":
+                return value
+    return None
+
+
+def _step_failure_diagnostic(
+    step: Any,
+    *,
+    verify: str,
+    evidence: str,
+) -> tuple[str, str, str]:
+    """Project a full StepRecord failure into bounded code/expected/observed data.
+
+    The raw error and result_data deliberately stay out of VerdictReport and the
+    terminal.  Native navigation metadata is stable enough to retain the useful
+    comparison: the failed/current goal on the expected side and the reported
+    waypoint/robot position on the observed side.
+    """
+
+    if evidence == EVIDENCE_GROUNDED:
+        return "", "", ""
+
+    result_data = getattr(step, "result_data", {}) or {}
+    structured = dict(result_data) if isinstance(result_data, dict) else {}
+    error_data = _error_payload(step)
+    payloads = (structured, error_data)
+
+    diagnosis = _short_value(
+        _first_value(
+            payloads,
+            ("diagnosis_code", "error_code", "failure_code", "diagnosis"),
+        )
+    )
+    step_success = bool(getattr(step, "success", False))
+    verify_result = bool(getattr(step, "verify_result", False))
+    actor = getattr(getattr(step, "actor_caused", None), "value", "")
+    if not diagnosis:
+        if not step_success:
+            diagnosis = "execution_failed"
+        elif not verify_result:
+            diagnosis = "verification_failed"
+        elif actor == "UNCAUSED":
+            diagnosis = "actor_not_caused"
+        else:
+            diagnosis = "evidence_not_grounded"
+
+    expected_value = _first_value(
+        payloads,
+        (
+            "expected_goal",
+            "expected_waypoint",
+            "expected_xy",
+            "expected",
+            "failed_waypoint",
+            "target_waypoint",
+            "target_xy",
+            "goal_xy",
+            "target",
+            "requested_room",
+            "canonical_room",
+            "room",
+        ),
+    )
+    observed_keys = (
+        (
+            "available_rooms",
+            "observed_waypoint",
+            "observed_goal",
+            "observed_xy",
+            "observed",
+            "actual_waypoint",
+            "actual_xy",
+            "actual",
+            "position_xy",
+        )
+        if diagnosis in {"unknown_room", "invalid_room"}
+        else (
+            "observed_waypoint",
+            "observed_goal",
+            "observed_xy",
+            "observed",
+            "actual_waypoint",
+            "actual_xy",
+            "actual",
+            "position_xy",
+            "available_rooms",
+        )
+    )
+    observed_value = _first_value(payloads, observed_keys)
+    if observed_value is None:
+        robot_state = _first_value(payloads, ("robot_state_after",))
+        if isinstance(robot_state, dict):
+            observed_value = (
+                robot_state.get("position_xy")
+                or robot_state.get("position")
+            )
+
+    expected = _short_value(expected_value)
+    observed = _short_value(observed_value)
+    if not expected and verify:
+        expected = _short_value(verify)
+    if not observed and (not verify_result or evidence != EVIDENCE_GROUNDED):
+        observed = _short_value(verify_result)
+    return diagnosis, expected, observed
+
 
 @dataclass(frozen=True)
 class StepVerdict:
@@ -65,6 +247,11 @@ class StepVerdict:
     verify: str
     verify_result: bool
     evidence: str  # GROUNDED | RAN | FAILED (from classify_step_evidence)
+    # Bounded human/machine diagnostic projection. Full StepRecord error/result_data
+    # remain in the trace/log and are intentionally not copied into the verdict.
+    diagnosis_code: str = ""
+    expected: str = ""
+    observed: str = ""
 
 
 @dataclass(frozen=True)
@@ -120,6 +307,11 @@ class VerdictReport:
                 verify_str = sg.verify
             if ev == EVIDENCE_GROUNDED:
                 n_grounded += 1
+            diagnosis, expected, observed = _step_failure_diagnostic(
+                s,
+                verify=verify_str,
+                evidence=ev,
+            )
             per_step.append(
                 StepVerdict(
                     name=s.sub_goal_name,
@@ -128,6 +320,9 @@ class VerdictReport:
                     verify=verify_str,
                     verify_result=bool(s.verify_result),
                     evidence=ev,
+                    diagnosis_code=diagnosis,
+                    expected=expected,
+                    observed=observed,
                 )
             )
 
@@ -167,6 +362,20 @@ class VerdictReport:
             per_step=(),
             error=error,
         )
+
+    def compact_failure_reason(self) -> str:
+        """Return exactly one concise reason, preferring the final failed retry."""
+
+        for step in reversed(self.per_step):
+            if not step.diagnosis_code:
+                continue
+            parts = [step.diagnosis_code]
+            if step.expected:
+                parts.append(f"expected={step.expected}")
+            if step.observed:
+                parts.append(f"observed={step.observed}")
+            return " · ".join(parts)
+        return ""
 
     # ------------------------------------------------------------------
     # Serialization + exit-code contract.

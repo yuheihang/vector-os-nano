@@ -165,9 +165,9 @@ class TestBridgeTerrainWiring:
         assert "_terrain_acc" in src
 
     def test_bridge_has_terrain_map_path(self):
-        """Bridge configures terrain map save path."""
+        """Bridge resolves the session terrain map save/load path."""
         src = read_bridge_source()
-        assert "terrain_map.npz" in src
+        assert "terrain_map_file()" in src
         assert "_terrain_map_path" in src
 
     def test_accumulate_in_publish_pointcloud(self):
@@ -231,6 +231,7 @@ class TestClearMemoryTerrain:
         )
         with open(cli_path) as f:
             src = f.read()
-        assert "terrain_map" in src, (
-            "/clear_memory handler must delete terrain_map.npz"
+        assert "terrain_map_file()" in src, (
+            "/clear_memory handler must delete the session terrain map"
         )
+        assert "DEFAULT_TERRAIN_MAP_FILE" in src

@@ -19,6 +19,7 @@ REPL helpers (no sim, no LLM); the real acceptance is driving the actual REPL by
 """
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -64,6 +65,30 @@ def _noaction_trace(goal: str) -> ExecutionTrace:
     )
     tree = GoalTree(goal=goal, sub_goals=(sub,))
     return ExecutionTrace(goal_tree=tree, steps=(step,), success=True, total_duration_sec=0.0)
+
+
+def test_repeated_native_attempts_render_as_one_compact_row() -> None:
+    sub_goals = [
+        SimpleNamespace(verify="at_position(3.2, 2.5)") for _ in range(3)
+    ]
+    steps = [
+        SimpleNamespace(
+            strategy="navigate_xy",
+            verify_result=False,
+            actor_caused=ActorCaused.CAUSED,
+        )
+        for _ in range(3)
+    ]
+
+    assert cli._compact_native_step_rows(sub_goals, steps) == [
+        (
+            "navigate_xy",
+            "at_position(3.2, 2.5)",
+            False,
+            "CAUSED",
+            3,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +144,14 @@ class _FakeEngine:
             raise RuntimeError("classify boom")
         return SimpleNamespace(use_vgg=self._use_vgg)
 
-    def run_turn_native(self, user_message, agent=None, session=None, app_state=None):  # noqa: ANN001
+    def run_turn_native(
+        self,
+        user_message,
+        agent=None,
+        session=None,
+        app_state=None,
+        on_progress=None,
+    ):  # noqa: ANN001
         self.native_calls += 1
         if isinstance(self._trace, Exception):
             raise self._trace
@@ -127,6 +159,7 @@ class _FakeEngine:
 
 
 def _stub_oracle(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "create_session", lambda **kwargs: _FakeSession())
     monkeypatch.setattr(
         "vector_os_nano.vcli.cognitive.trace_store.verify_oracle_names",
         lambda agent, engine: frozenset({"at_position"}),
@@ -237,3 +270,59 @@ def test_repl_attempt_native_false_verdict_when_verify_fails(monkeypatch) -> Non
     assert acted is True, "native dispatched an action -> it owns the turn"
     assert "verified=False" in console.text, "a failed verify must surface verified=False (honest)"
     assert "Verified: False" in session.asst[0]
+
+
+def test_repl_failed_retries_render_one_compact_reason_and_log_full_detail(
+    monkeypatch, caplog,
+) -> None:
+    _stub_oracle(monkeypatch)
+    sub_goals = tuple(
+        SubGoal(
+            name=f"native_step_{index}",
+            description="navigate",
+            verify="at_position(6.6, 3.0)",
+            strategy="navigate_room",
+        )
+        for index in range(3)
+    )
+    steps = tuple(
+        StepRecord(
+            sub_goal_name=f"native_step_{index}",
+            strategy="navigate_room",
+            success=False,
+            verify_result=False,
+            duration_sec=1.0,
+            error="full FAR controller detail kept out of terminal",
+            result_data={
+                "diagnosis_code": "stale_planner_response",
+                "expected_goal": [6.6, 3.0],
+                "observed_waypoint": [6.6, 8.0],
+            },
+            actor_caused=ActorCaused.UNCAUSED,
+        )
+        for index in range(3)
+    )
+    trace = ExecutionTrace(
+        goal_tree=GoalTree(goal="go living room", sub_goals=sub_goals),
+        steps=steps,
+        success=False,
+        total_duration_sec=3.0,
+    )
+    engine = _FakeEngine(trace)
+    session = _FakeSession()
+    console = _FakeConsole()
+    caplog.set_level(logging.INFO, logger=cli.__name__)
+
+    acted = cli._repl_attempt_native(
+        engine, "导航到 living room", session, {}, console
+    )
+
+    assert acted is True
+    assert "3 attempts" in console.text
+    assert console.text.count("reason") == 1
+    assert console.text.count("stale_planner_response") == 1
+    assert "expected=(6.6, 3)" in console.text
+    assert "observed=(6.6, 8)" in console.text
+    assert "full FAR controller detail" not in console.text
+    assert "full FAR controller detail" in caplog.text
+    assert session.asst[0].count("Reason:") == 1

@@ -79,15 +79,23 @@ class RobotWorld:
         ):
             # Ground the base predicates the go2 vocab verifies against. The plain
             # robot world has no Scenario, so ``visited`` (which needs a named-room
-            # set) is left to the playground; ``at_position`` / ``facing`` need
-            # only the live base and replace the engine stubs.
+            # set) is left to the playground. ``in_room`` instead reads the live
+            # SceneGraph used by navigation; it prefers exact room geometry and
+            # records when the shared resolver must fall back to nearest-centre.
             from vector_os_nano.vcli.worlds.go2_sim_oracle import (
                 make_at_position,
                 make_facing,
+                make_in_room,
             )
+            scene_graph = getattr(agent, "_spatial_memory", None)
+            if scene_graph is None:
+                # Compatibility for proxy/fake agents that attach memory to the
+                # base before normal Agent wiring has completed.
+                scene_graph = getattr(base, "_scene_graph", None)
             ns.update({
                 "at_position": make_at_position(agent),
                 "facing": make_facing(agent),
+                "in_room": make_in_room(agent, scene_graph=scene_graph),
             })
 
         return ns

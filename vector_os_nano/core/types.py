@@ -213,6 +213,7 @@ class SkillResult:
             "success": self.success,
             "result_data": self.result_data,
             "error_message": self.error_message,
+            "diagnosis_code": self.diagnosis_code or "",
         }
 
     @classmethod
@@ -221,6 +222,7 @@ class SkillResult:
             success=bool(d["success"]),
             result_data=dict(d.get("result_data", {})),
             error_message=str(d.get("error_message", "")),
+            diagnosis_code=str(d.get("diagnosis_code") or ""),
         )
 
 

@@ -1192,7 +1192,7 @@ class VectorEngine:
     def _verify_for_skill(skill_name: str, arg: str) -> str:
         """Generate a verify expression for a known skill."""
         _VERIFY_MAP: dict[str, str] = {
-            "navigate": "nearest_room() == '{arg}'" if arg else "True",
+            "navigate": "in_room('{arg}')" if arg else "False",
             "explore": "True",  # async skill — launched = success, progress via events
             "patrol": "True",   # async skill — launched = success
             "look": "len(describe_scene()) > 0",
@@ -1210,16 +1210,29 @@ class VectorEngine:
     def _resolve_room_alias(self, room_input: str) -> str:
         """Resolve a room name/alias to canonical SceneGraph ID.
 
-        Uses NavigateSkill's alias table + SceneGraph fuzzy match.
+        Uses the shared RoomResolver over the live SceneGraph.
         Returns empty string if unresolvable.
         """
         try:
-            from vector_os_nano.skills.navigate import _resolve_room
+            from vector_os_nano.navigation.room_resolver import RoomResolver, UnknownRoom
         except ImportError:
             return ""
         agent = getattr(self, "_vgg_agent", None)
         sg = getattr(agent, "_spatial_memory", None) if agent else None
-        return _resolve_room(room_input, sg=sg) or ""
+        if sg is None:
+            return ""
+        try:
+            world_mode = getattr(agent, "_world_mode", None)
+            if not world_mode:
+                config = getattr(agent, "_config", None)
+                world_mode = (
+                    config.get("world_mode")
+                    if isinstance(config, dict)
+                    else None
+                )
+            return RoomResolver(sg, world_mode=world_mode).canonicalize(room_input)
+        except (UnknownRoom, ValueError):
+            return ""
 
     def vgg_execute(self, goal_tree: "GoalTree") -> "ExecutionTrace":
         """Execute GoalTree with feedback harness (retry + re-plan on failure)."""

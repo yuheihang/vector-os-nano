@@ -10,8 +10,13 @@ from __future__ import annotations
 
 import math
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from vector_os_nano.navigation.room_resolver import (
+    RoomPositionUnknown,
+    RoomResolver,
+    UnknownRoom,
+)
 from vector_os_nano.vcli.primitives import PrimitiveContext
 
 if TYPE_CHECKING:
@@ -138,11 +143,43 @@ def get_door_chain(from_room: str, to_room: str) -> list[tuple[float, float, str
     return list(sg.get_door_chain(from_room, to_room))
 
 
-def navigate_to_room(room: str) -> bool:
-    """Navigate to a named room.
+def _formal_navigate_skill() -> Any | None:
+    if _ctx is None or _ctx.skill_registry is None:
+        return None
+    getter = getattr(_ctx.skill_registry, "get", None)
+    return getter("navigate") if callable(getter) else None
 
-    Looks up a NavigateSkill in the skill registry if available, otherwise
-    falls back to publishing a goal derived from the SceneGraph.
+
+def _skill_context() -> Any:
+    from vector_os_nano.core.skill import SkillContext
+
+    services = {"spatial_memory": _ctx.scene_graph}
+    if _ctx.nav_client is not None:
+        services["nav"] = _ctx.nav_client
+    return SkillContext(
+        base=_ctx.base,
+        services=services,
+    )
+
+
+def _hold_position() -> None:
+    """Best-effort fail-closed stop for a rejected navigation request."""
+
+    if _ctx is None or _ctx.base is None:
+        return
+    stop_navigation = getattr(_ctx.base, "stop_navigation", None)
+    if callable(stop_navigation):
+        stop_navigation()
+        return
+    set_velocity = getattr(_ctx.base, "set_velocity", None)
+    if callable(set_velocity):
+        set_velocity(0.0, 0.0, 0.0)
+
+
+def navigate_room(room: str) -> bool:
+    """Navigate to a named room through the shared resolver/formal skill.
+
+    Unknown names fail closed before any coordinate is published.
 
     Args:
         room: Target room name.
@@ -158,36 +195,49 @@ def navigate_to_room(room: str) -> bool:
             "Primitives not initialized. Call init_primitives() first."
         )
 
-    # Attempt via skill registry
-    if _ctx.skill_registry is not None:
-        registry = _ctx.skill_registry
-        skill = None
-        # Try common names for the navigate skill
-        for candidate in ("navigate", "NavigateSkill", "go_to"):
-            try:
-                skill = registry.get_skill(candidate)
-                break
-            except Exception:
-                pass
-
-        if skill is not None:
-            try:
-                from vector_os_nano.core.skill import SkillContext
-                ctx_obj = SkillContext(
-                    base=_ctx.base,
-                    scene_graph=_ctx.scene_graph,
-                    nav_client=_ctx.nav_client,
-                )
-                result = skill.execute({"room": room}, ctx_obj)
-                return bool(getattr(result, "success", False))
-            except Exception:
-                pass  # Fall through to SceneGraph path
-
-    # Fall back: use SceneGraph to find room center then publish goal
     sg = _require_scene_graph()
-    room_node = sg.get_room(room)
-    if room_node is None:
+    try:
+        resolved = RoomResolver(sg).resolve(room)
+    except (UnknownRoom, RoomPositionUnknown):
+        _hold_position()
         return False
 
-    publish_goal(room_node.center_x, room_node.center_y)
-    return wait_until_near(room_node.center_x, room_node.center_y)
+    skill = _formal_navigate_skill()
+    if skill is not None:
+        result = skill.execute({"room": resolved.canonical}, _skill_context())
+        return bool(getattr(result, "success", False))
+
+    # A named room is not a coordinate shortcut.  Without the formal skill
+    # there is no source-room membership check or executable door topology, so
+    # publishing the room centre could send the robot through a wall.
+    _hold_position()
+    return False
+
+
+def navigate_xy(x: float, y: float) -> bool:
+    """Navigate to an explicit finite world coordinate."""
+
+    if _ctx is None:
+        raise RuntimeError(
+            "Primitives not initialized. Call init_primitives() first."
+        )
+    if isinstance(x, bool) or isinstance(y, bool):
+        return False
+    try:
+        tx, ty = float(x), float(y)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(tx) and math.isfinite(ty)):
+        return False
+    skill = _formal_navigate_skill()
+    if skill is not None:
+        result = skill.execute({"x": tx, "y": ty}, _skill_context())
+        return bool(getattr(result, "success", False))
+    publish_goal(tx, ty)
+    return wait_until_near(tx, ty)
+
+
+def navigate_to_room(room: str) -> bool:
+    """Backward-compatible alias for :func:`navigate_room`."""
+
+    return navigate_room(room)

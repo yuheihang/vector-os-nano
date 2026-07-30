@@ -116,6 +116,49 @@ def test_per_step_evidence_equals_classifier() -> None:
     assert report.per_step[0].verify == "at_position(2.0, 0.0)"
 
 
+def test_failed_step_projects_only_compact_structured_diagnostic() -> None:
+    sg = SubGoal(
+        name="s1",
+        description="navigate",
+        verify="at_position(6.6, 3.0)",
+        strategy="navigate_room",
+    )
+    step = StepRecord(
+        sub_goal_name="s1",
+        strategy="navigate_room",
+        success=False,
+        verify_result=False,
+        duration_sec=30.0,
+        error="full controller trace that belongs only in the log",
+        result_data={
+            "diagnosis_code": "stale_planner_response",
+            "expected_goal": [6.6, 3.0],
+            "observed_waypoint": {
+                "label": "old dining door",
+                "xy": [6.6, 8.0],
+            },
+        },
+    )
+    trace = ExecutionTrace(
+        goal_tree=GoalTree(goal="go living room", sub_goals=(sg,)),
+        steps=(step,),
+        success=False,
+        total_duration_sec=30.0,
+    )
+
+    report = VerdictReport.from_trace(trace, ORACLES)
+    verdict = report.per_step[0]
+
+    assert verdict.diagnosis_code == "stale_planner_response"
+    assert verdict.expected == "(6.6, 3)"
+    assert verdict.observed == "old dining door@(6.6, 8)"
+    assert report.compact_failure_reason() == (
+        "stale_planner_response · expected=(6.6, 3) · "
+        "observed=old dining door@(6.6, 8)"
+    )
+    assert "full controller trace" not in report.to_sentinel_line()
+
+
 # ---------------------------------------------------------------------------
 # (3) exit-code contract: verified == (exit == 0)
 # ---------------------------------------------------------------------------

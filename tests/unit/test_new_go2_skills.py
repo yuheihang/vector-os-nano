@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -32,6 +33,26 @@ def _make_base(x: float = 3.0, y: float = 2.5, z: float = 0.28, heading: float =
 
 def _make_context(base=None) -> SkillContext:
     return SkillContext(base=base)
+
+
+def _make_layout_context(base=None) -> SkillContext:
+    """Attach the live layout graph; room coordinates never live in the skill."""
+    from vector_os_nano.core.scene_graph import SceneGraph
+
+    graph = SceneGraph()
+    layout = Path(__file__).resolve().parents[2] / "config" / "room_layout.yaml"
+    assert graph.load_layout(str(layout)) == 8
+    return SkillContext(base=base, services={"spatial_memory": graph})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_abort_signal():
+    """Emergency-stop tests must not abort unrelated tests later in the run."""
+    from vector_os_nano.vcli.cognitive.abort import clear_abort
+
+    clear_abort()
+    yield
+    clear_abort()
 
 
 # ===========================================================================
@@ -97,7 +118,7 @@ class TestWhereAmISkill:
     def test_reports_room_living_room(self):
         # (3.0, 2.5) is the living_room center
         base = _make_base(x=3.0, y=2.5)
-        ctx = _make_context(base)
+        ctx = _make_layout_context(base)
         result = WhereAmISkill().execute({}, ctx)
 
         assert result.success
@@ -106,7 +127,7 @@ class TestWhereAmISkill:
     def test_reports_room_kitchen(self):
         # (17.0, 2.5) is the kitchen center
         base = _make_base(x=17.0, y=2.5)
-        ctx = _make_context(base)
+        ctx = _make_layout_context(base)
         result = WhereAmISkill().execute({}, ctx)
 
         assert result.success
@@ -156,7 +177,7 @@ class TestWhereAmISkill:
 
     def test_room_center_in_result(self):
         base = _make_base(x=3.0, y=2.5)
-        ctx = _make_context(base)
+        ctx = _make_layout_context(base)
         result = WhereAmISkill().execute({}, ctx)
 
         center = result.result_data["room_center"]
@@ -247,15 +268,14 @@ class TestExploreNonBlocking:
 
     def test_cancel_exploration(self):
         """cancel_exploration sets the cancel event."""
-        from vector_os_nano.skills.go2.explore import (
-            cancel_exploration, _explore_cancel,
-        )
         import vector_os_nano.skills.go2.explore as _mod
         _mod._explore_running = True
-        cancel_exploration()
-        assert _explore_cancel.is_set()
+        _mod.cancel_exploration()
+        # Read the live module attribute: other lifecycle tests may reload the
+        # module, making a separately imported Event reference stale.
+        assert _mod._explore_cancel.is_set()
         _mod._explore_running = False
-        _explore_cancel.clear()
+        _mod._explore_cancel.clear()
 
     def test_get_explored_rooms(self):
         """get_explored_rooms returns sorted room list."""

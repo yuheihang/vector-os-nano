@@ -37,7 +37,16 @@ def _make_context(with_nav=False):
     base.walk.return_value = True
     base.get_position.return_value = [10.0, 3.0, 0.27]
     base.get_heading.return_value = 0.0
-    base.navigate_to = MagicMock(return_value=True)
+    base.navigate_to = MagicMock()
+
+    def _navigate_to(x, y, **_kwargs):
+        # A successful FAR contract means the requested segment actually landed.
+        # Keeping position stale would correctly trip P2's fail-closed tolerance
+        # check and is not a valid navigation fake.
+        base.get_position.return_value = [float(x), float(y), 0.27]
+        return True
+
+    base.navigate_to.side_effect = _navigate_to
     sg = _make_scene_graph()
     services = {"spatial_memory": sg}
     if with_nav:
@@ -78,14 +87,25 @@ class TestNavigateSkillMetadata:
 
 class TestNavigateWithNavStack:
     def test_proxy_navigate_to_used_when_available(self):
-        """Mode 0: base.navigate_to() takes priority when present (Go2ROS2Proxy)."""
+        """Executable v2 layout expands the room goal into FAR segments."""
         from vector_os_nano.skills.navigate import NavigateSkill
         ctx = _make_context(with_nav=True)
         skill = NavigateSkill()
         result = skill.execute({"room": "kitchen"}, ctx)
         assert result.success
-        # Proxy mode: base.navigate_to called, NOT nav service
-        ctx.base.navigate_to.assert_called_once()
+        # hallway -> kitchen is pre/center/post + room_goal; the direct nav
+        # service is never used in known-layout v2 mode.
+        assert [call.args[:2] for call in ctx.base.navigate_to.call_args_list] == [
+            (13.4, 3.0),
+            (14.0, 3.0),
+            (14.6, 3.0),
+            (17.0, 2.5),
+        ]
+        assert all(
+            call.kwargs["allow_door_fallback"] is False
+            for call in ctx.base.navigate_to.call_args_list
+        )
+        ctx.services["nav"].navigate_to.assert_not_called()
 
     def test_proxy_receives_kitchen_coordinates(self):
         from vector_os_nano.skills.navigate import NavigateSkill
@@ -97,14 +117,16 @@ class TestNavigateWithNavStack:
         assert 15 < args[0][0] < 19
         assert 1 < args[0][1] < 4
 
-    def test_proxy_failure_falls_back_to_dead_reckoning(self):
+    def test_proxy_segment_failure_does_not_fall_back_or_skip(self):
         from vector_os_nano.skills.navigate import NavigateSkill
         ctx = _make_context(with_nav=True)
-        ctx.base.navigate_to.return_value = False
+        ctx.base.navigate_to.side_effect = lambda *_args, **_kwargs: False
         skill = NavigateSkill()
         result = skill.execute({"room": "kitchen"}, ctx)
-        # Proxy failed → falls back to dead-reckoning (which also uses navigate_to for door chain)
-        assert ctx.base.navigate_to.called
+        assert not result.success
+        assert result.diagnosis_code == "segment_no_path"
+        assert ctx.base.navigate_to.call_count == 1
+        ctx.services["nav"].navigate_to.assert_not_called()
 
     def test_nav_unavailable_falls_back_to_dead_reckoning(self):
         """nav service present but is_available=False -> falls back to dead-reckoning."""
@@ -116,8 +138,14 @@ class TestNavigateWithNavStack:
             walk=MagicMock(return_value=True),
             get_position=MagicMock(return_value=[10.0, 3.0, 0.27]),
             get_heading=MagicMock(return_value=0.0),
-            navigate_to=MagicMock(return_value=True),
+            navigate_to=MagicMock(),
         )
+
+        def _navigate_to(x, y, **_kwargs):
+            base.get_position.return_value = [float(x), float(y), 0.27]
+            return True
+
+        base.navigate_to.side_effect = _navigate_to
         sg = _make_scene_graph()
         ctx = SkillContext(
             bases={"go2": base},

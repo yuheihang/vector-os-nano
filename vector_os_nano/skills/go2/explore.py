@@ -32,6 +32,11 @@ from typing import Any
 
 from vector_os_nano.core.skill import SkillContext, skill
 from vector_os_nano.core.types import SkillResult
+from vector_os_nano.navigation.runtime_files import (
+    explore_finished_file,
+    nav_active_file,
+    nav_replay_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +187,7 @@ def stop_tare_only() -> None:
 
     # Remove nav flag — bridge path follower stops acting on TARE paths
     try:
-        os.remove("/tmp/vector_nav_active")
+        os.remove(nav_active_file())
     except FileNotFoundError:
         pass
 
@@ -447,7 +452,6 @@ def _exploration_loop(base: Any, has_bridge: bool = True) -> None:
 
     _explore_visited.clear()
     _explore_running = True
-    _explore_cancel.clear()
 
     _total = len(_spatial_memory.get_all_rooms()) if _spatial_memory else 0
     _emit("started", {"total_rooms": _total})
@@ -483,7 +487,7 @@ def _exploration_loop(base: Any, has_bridge: bool = True) -> None:
     # Enable bridge path follower via nav flag
     if has_bridge:
         try:
-            with open("/tmp/vector_nav_active", "w") as f:
+            with open(nav_active_file(), "w") as f:
                 f.write("1")
             logger.info("[EXPLORE] Navigation enabled (flag file created)")
         except Exception as exc:
@@ -643,9 +647,10 @@ def _exploration_loop(base: Any, has_bridge: bool = True) -> None:
                 pass
 
             # Check if TARE declared exploration complete (all frontiers covered)
-            if os.path.exists("/tmp/vector_explore_finished"):
+            finished_file = explore_finished_file()
+            if os.path.exists(finished_file):
                 try:
-                    os.remove("/tmp/vector_explore_finished")
+                    os.remove(finished_file)
                 except OSError:
                     pass
                 logger.info("[EXPLORE] TARE exploration complete — all frontiers covered")
@@ -667,7 +672,7 @@ def _exploration_loop(base: Any, has_bridge: bool = True) -> None:
         # Terrain replay fires on ALL exit paths (finish, cancel, crash)
         # so FAR always gets accumulated map data for V-Graph building.
         try:
-            with open("/tmp/vector_terrain_replay", "w") as f:
+            with open(nav_replay_file(), "w") as f:
                 f.write("1")
             logger.info("[EXPLORE] Triggered terrain replay for FAR")
         except OSError:
@@ -739,7 +744,18 @@ class ExploreSkill:
 
         # Ensure room layout is loaded (handles /clear_memory wiping the data)
         if _spatial_memory is not None and hasattr(_spatial_memory, 'load_layout'):
-            if not _spatial_memory.get_all_rooms():
+            from vector_os_nano.navigation.world_mode import WorldMode, get_world_mode
+
+            _configured_mode = None
+            try:
+                _configured_mode = (context.config or {}).get("world_mode")
+            except Exception:
+                pass
+            _mode = get_world_mode(_configured_mode)
+            if (
+                _mode is WorldMode.KNOWN_LAYOUT
+                and not _spatial_memory.get_all_rooms()
+            ):
                 _layout = os.path.join(
                     os.path.dirname(os.path.dirname(os.path.dirname(
                         os.path.dirname(os.path.abspath(__file__))
@@ -762,6 +778,10 @@ class ExploreSkill:
         bridge_ok = True
 
         # Start background thread that handles seeding + monitoring
+        # Arm cancellation before the worker starts.  Clearing inside the
+        # worker creates a race where an immediate navigate()/stop() sets the
+        # event and the late-starting worker erases that request.
+        _explore_cancel.clear()
         _explore_thread = threading.Thread(
             target=_exploration_loop, args=(base, bridge_ok), daemon=True,
         )

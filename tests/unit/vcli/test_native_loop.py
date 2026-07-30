@@ -37,6 +37,11 @@ from vector_os_nano.vcli.cognitive.trace_store import (
     verify_oracle_names,
 )
 from vector_os_nano.vcli.session import Session
+from vector_os_nano.vcli.native_loop import (
+    NativeStepRunner,
+    _MAX_IDENTICAL_NAV_FAILURES,
+)
+from vector_os_nano.vcli.tools.base import ToolResult
 from vector_os_nano.vcli.verdict import VerdictReport
 
 
@@ -311,6 +316,40 @@ def test_replan_is_model_driven_not_runner_state() -> None:
     report = VerdictReport.from_trace(trace, oracle_names)
     # A trace with ANY non-GROUNDED checked step is NOT verified (all-must-pass).
     assert report.verified is False
+
+
+def test_identical_navigation_failure_budget_is_bounded() -> None:
+    """Repeated physical navigation cannot consume the full 24-turn loop."""
+
+    class _AlwaysFailsNavigation:
+        def execute(self, _params, _context):
+            return ToolResult(
+                content="route unavailable",
+                is_error=True,
+                metadata={"diagnosis_code": "navigation_failed"},
+            )
+
+    class _Verifier:
+        def verify(self, _expr):
+            return False
+
+    agent, _ = _make_agent(0.0, 0.0)
+    runner = NativeStepRunner(
+        agent,
+        _Verifier(),
+        frozenset({"at_position"}),
+        {"navigate_xy": _AlwaysFailsNavigation()},
+        SimpleNamespace(agent=agent),
+    )
+
+    for attempt in range(1, _MAX_IDENTICAL_NAV_FAILURES + 1):
+        runner.dispatch_skill("navigate_xy", {"x": 3.2, "y": 2.5})
+        result = runner.handle_verify("at_position(3.2, 2.5)")
+        assert runner.navigation_recovery_exhausted is (
+            attempt == _MAX_IDENTICAL_NAV_FAILURES
+        )
+    assert "recovery stopped" in result.content
+    assert len(runner.build_trace("navigate").steps) == _MAX_IDENTICAL_NAV_FAILURES
 
 
 def test_empty_script_yields_unverified_empty_trace() -> None:

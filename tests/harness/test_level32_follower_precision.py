@@ -142,7 +142,7 @@ class TestCrossTrackCorrection:
 
     C++ pathFollower uses:
       vx = speed * cos(dirDiff)
-      vy = -speed * sin(dirDiff)
+      vy = speed * sin(dirDiff)
 
     This naturally steers the robot back to the path using lateral velocity.
     """
@@ -159,14 +159,11 @@ class TestCrossTrackCorrection:
         )
 
     def test_vy_correction_sign(self):
-        """vy should be -speed*sin(dirDiff) — negative sin for correct direction."""
+        """Positive heading error must command positive body-left velocity."""
         src = read_bridge_source()
         follow = src[src.find("def _follow_path"):]
-        # Should have: vy = -target_speed * sin(dir_diff) or similar
-        has_neg_sin = "-target_speed * math.sin" in follow or "-speed * sin" in follow
-        # Also accept: vy = target_speed * (-sin) variant
-        assert has_neg_sin or ("-" in follow and "sin(dir_diff)" in follow), (
-            "vy correction should use negative sin for correct lateral direction"
+        assert "vy = track_speed * math.sin(dir_diff)" in follow, (
+            "vy correction must follow BaseProtocol: positive body-y is left"
         )
 
 
@@ -220,7 +217,7 @@ class TestFollowerBehavior:
             vy = 0.0
         elif end_dis > _STOP_DIS:
             vx = target_speed * math.cos(dir_diff)
-            vy = -target_speed * math.sin(dir_diff)
+            vy = target_speed * math.sin(dir_diff)
             vx = max(-0.3, vx)  # cap reverse
             vy = max(-_MAX_LAT, min(_MAX_LAT, vy))
 

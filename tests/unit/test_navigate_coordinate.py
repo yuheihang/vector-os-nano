@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 from vector_os_nano.core.skill import SkillContext
 from vector_os_nano.core.world_model import WorldModel
 from vector_os_nano.skills.navigate import NavigateSkill
+from vector_os_nano.vcli.worlds.go2_sim_oracle import AT_POSITION_TOL_M
 
 
 def _ctx(arrived=True, pos=(10.75, 3.05, 0.35)):
@@ -36,6 +37,7 @@ def test_navigate_xy_drives_navigate_to_without_room():
     args, kwargs = ctx.base.navigate_to.call_args
     assert float(args[0]) == 10.5
     assert float(args[1]) == 3.0
+    assert kwargs["arrival_tolerance"] == AT_POSITION_TOL_M
     assert res.result_data["target"] == [10.5, 3.0]
     assert res.result_data["mode"] == "proxy_coord"
 
@@ -56,11 +58,8 @@ def test_navigate_xy_no_base_fails_loud():
     assert res.diagnosis_code == "no_base"
 
 
-def test_navigate_xy_far_false_but_in_vicinity_succeeds():
-    """FAR returning False (no arrival confirm) but the dog ended in the goal
-    VICINITY -> step succeeds (the at_position verify oracle, RAN, is the honest
-    arrival grade; step success only gates dependents). Dog at (11.0, 3.0), goal
-    (10.5, 3.0): 0.5 m away, well within the vicinity radius."""
+def test_navigate_xy_far_false_but_inside_verify_radius_succeeds():
+    """Actual geometry wins when FAR times out exactly at the verify boundary."""
     ctx = _ctx(arrived=False, pos=(11.0, 3.0, 0.35))
     res = NavigateSkill().execute({"x": 10.5, "y": 3.0}, ctx)
     ctx.base.navigate_to.assert_called_once()
@@ -69,9 +68,17 @@ def test_navigate_xy_far_false_but_in_vicinity_succeeds():
     assert res.result_data["position"] == [11.0, 3.0]
 
 
+def test_navigate_xy_far_true_outside_verify_radius_fails_loud():
+    """Transport success at 0.7 m cannot bypass the 0.5 m verifier contract."""
+    ctx = _ctx(arrived=True, pos=(11.2, 3.0, 0.35))
+    res = NavigateSkill().execute({"x": 10.5, "y": 3.0}, ctx)
+    assert res.success is False
+    assert res.diagnosis_code == "navigation_failed"
+    assert res.result_data["far_confirmed"] is True
+
+
 def test_navigate_xy_far_false_and_far_away_fails_loud():
-    """FAR False AND the dog far from the goal (couldn't route) -> fail loud.
-    Dog at (14.0, 3.0), goal (10.5, 3.0): 3.5 m away, outside the vicinity."""
+    """FAR False AND the dog far from the goal (couldn't route) -> fail loud."""
     ctx = _ctx(arrived=False, pos=(14.0, 3.0, 0.35))
     res = NavigateSkill().execute({"x": 10.5, "y": 3.0}, ctx)
     assert res.success is False

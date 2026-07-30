@@ -27,12 +27,14 @@ would still grade CAUSED (the command signal fires); proving caused-ONLY-by requ
 a shadow MjData re-step (re-simulate from the baseline applying only the recorded
 commands and compare) — explicitly OUT OF SCOPE this round.
 
-ALSO OUT OF SCOPE (documented, deferred): the live go2 ``navigate`` path drives via
-a ROS2 bridge whose ``cmd_vel`` runs on another thread and is GATED OUT before the
-instrumented counter (``mujoco_go2.set_velocity`` returns at the ``_gated`` guard
-when the caller is not the skill-token thread). Only ``walk()``/``walk_forward``
-(which set ``_skill_ctrl_tid`` so their ``set_velocity`` is ungated + counted) carry
-an honest actor-causation signal. Grading the bridge/nav route is deferred.
+P1 NAVIGATION EXTENSION: the live go2 ``navigate`` path drives through a ROS2
+bridge on another thread, so it cannot rely on the skill-thread token used by
+``walk``.  Native navigation now opens a ``goal_id`` scope; the proxy accepts only
+monotonic telemetry for that goal, and the bridge counts velocity only when the
+plant-side ``cmd_motion`` counter advances across its one ``set_velocity`` boundary.
+The cumulative goal-scoped counter exposed by ``base.cmd_motion()`` is then graded
+with the same required pose displacement below. No-goal drift, gated commands, and
+late samples from another goal cannot become navigation causation evidence.
 
 Single-sourced into ``classify_step_evidence`` (trace_store) so the actor-causation
 verdict flows to BOTH gates and the VECTOR_VERDICT report — no split-brain.
@@ -318,7 +320,9 @@ def baseline_namespace(baseline: ActorBaseline) -> dict[str, Callable[..., Any]]
 # Predicate-name -> the actor channel it implicates. A verify expression naming
 # any of these is a "robot-predicate" step whose causation we grade; the channel
 # decides which counter / displacement to consult.
-_BASE_PREDICATES: frozenset[str] = frozenset({"at_position", "facing", "visited"})
+_BASE_PREDICATES: frozenset[str] = frozenset(
+    {"at_position", "facing", "in_room", "visited"}
+)
 _ARM_PREDICATES: frozenset[str] = frozenset({"arm_at_home"})
 _GRIPPER_PREDICATES: frozenset[str] = frozenset({"holding_object", "is_holding", "holding"})
 
@@ -341,10 +345,11 @@ def _base_channel_caused(
     A base predicate's causation must come from the channel it actually measures,
     NOT a blended ``max(planar, yaw)`` (review fix STEP-12: a forward walk's planar
     move must NOT satisfy a ``facing(heading)`` no-op, and a pure turn's yaw move must
-    NOT satisfy ``at_position``/``visited``):
+    NOT satisfy ``at_position``/``in_room``/``visited``):
 
       - ``facing``                    -> heading channel: ``dyaw >= _YAW_CAUSE_EPS``
-      - ``at_position`` / ``visited`` -> planar channel:  ``dxy  >= DISPLACEMENT_EPS``
+      - ``at_position`` / ``in_room`` / ``visited`` -> planar channel:
+        ``dxy >= DISPLACEMENT_EPS``
 
     Returns None when the relevant snapshot is unavailable (grade fail-closes to
     UNCAUSED).
@@ -400,7 +405,7 @@ def grade(
     for such a step. Rules (fail-CLOSED — when in doubt, UNCAUSED, never CAUSED):
 
     - *baseline is None* (capture never ran) -> UNCAUSED (fail closed).
-    - The verify names a BASE predicate (at_position / facing / visited):
+    - The verify names a BASE predicate (at_position / facing / in_room / visited):
         CAUSED iff cumulative commanded |cmd| advanced by >= MOTION_EPS AND the base
         pose displaced by >= DISPLACEMENT_EPS. A NO-OP (no commanded motion) or a
         TELEPORT (no commanded motion, pose jumps) both -> UNCAUSED.

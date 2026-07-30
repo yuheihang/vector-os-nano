@@ -10,10 +10,18 @@ must log the unavailable case at DEBUG so it stays quiet in the non-verbose REPL
 """
 import importlib.util
 import logging
+import sys
 
 import pytest
 
-_RCLPY_PRESENT = importlib.util.find_spec("rclpy") is not None
+# Some ROS harness modules install an in-memory rclpy test double during
+# collection.  Such modules deliberately have no import spec, so calling
+# find_spec() on them raises ValueError.  Treat either a loaded module or an
+# importable distribution as "present" for this absent-runtime-only test.
+_RCLPY_PRESENT = (
+    "rclpy" in sys.modules
+    or importlib.util.find_spec("rclpy") is not None
+)
 _PROXY_LOGGER = "vector_os_nano.hardware.sim.go2_ros2_proxy"
 
 

@@ -19,6 +19,7 @@ These tests verify:
 """
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import re
@@ -203,14 +204,17 @@ class TestNavigateSkillModes:
     """Verify navigate skill falls back correctly."""
 
     def test_mode_priority_order(self):
-        """Navigate should try: proxy → nav_stack → dead_reckoning."""
-        src = navigate_source()
-        # Mode 0: proxy
-        proxy_idx = src.find("navigate_to")
-        # Mode 1: nav stack
-        nav_idx = src.find("nav_stack")
-        # Mode 2: dead reckoning
-        dr_idx = src.find("dead_reckoning")
+        """Legacy fallback remains proxy → nav_stack → dead_reckoning."""
+        from vector_os_nano.skills.navigate import NavigateSkill
+
+        # Scope this structural check to execute().  Searching the whole module
+        # is unstable because helper docstrings and result labels legitimately
+        # mention these modes before the actual dispatch branch.
+        src = inspect.getsource(NavigateSkill.execute)
+        proxy_idx = src.find('elif hasattr(context.base, "navigate_to")')
+        nav_idx = src.find('nav = context.services.get("nav")', proxy_idx)
+        dr_idx = src.find("result = self._dead_reckoning", nav_idx)
+        assert min(proxy_idx, nav_idx, dr_idx) >= 0
         assert proxy_idx < nav_idx < dr_idx, (
             "Mode priority should be: proxy → nav_stack → dead_reckoning"
         )
@@ -236,9 +240,9 @@ class TestNavigateSkillModes:
         )
 
     def test_nav_flag_created(self):
-        """Navigate should create /tmp/vector_nav_active for bridge."""
+        """Navigate should create the session navigation flag for bridge."""
         src = navigate_source()
-        assert "vector_nav_active" in src
+        assert "nav_active_file" in src
 
 
 # ===================================================================

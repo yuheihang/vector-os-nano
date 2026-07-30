@@ -44,13 +44,6 @@ _ARM_JOINT_NAMES: list[str] = [
     "piper_joint4", "piper_joint5", "piper_joint6",
 ]
 
-# Sensor frame offset relative to body origin — must match go2_vnav_bridge.py
-# _SENSOR_X/_SENSOR_Z constants (0.3 m forward, 0.2 m up).
-# The bridge publishes /state_estimation in sensor frame (body + offset).
-# _sync_ik_base must subtract this offset to obtain the true body position
-# that the MJCF free-body qpos[0:3] represents.
-_BODY_SENSOR_DX: float = 0.3  # forward offset (x) in body frame
-_BODY_SENSOR_DZ: float = 0.2  # up offset (z) in body frame
 _EE_SITE_NAME: str = "piper_ee_site"
 _GRIPPER_JOINT_NAME: str = "piper_joint7"
 
@@ -158,7 +151,18 @@ class PiperROS2Proxy:
         from sensor_msgs.msg import JointState
         from std_msgs.msg import Float64MultiArray
 
-        if not rclpy.ok():
+        # In shared mode the process singleton must own/validate the rclpy
+        # context *before* Node construction.  Initialising rclpy here first
+        # would make the context look externally owned and prevent a later
+        # simulation session from switching ROS_DOMAIN_ID safely.
+        use_shared_runtime = os.environ.get("VECTOR_SHARED_EXECUTOR", "1") == "1"
+        shared_runtime: Any | None = None
+        if use_shared_runtime:
+            from vector_os_nano.hardware.ros2.runtime import get_ros2_runtime
+
+            shared_runtime = get_ros2_runtime()
+            shared_runtime.ensure_initialized()
+        elif not rclpy.ok():
             rclpy.init()
 
         self._node = Node(self._node_name)
@@ -216,10 +220,9 @@ class PiperROS2Proxy:
         )
 
         # Route to shared executor or legacy per-proxy spin.
-        import os as _os
-        if _os.environ.get("VECTOR_SHARED_EXECUTOR", "1") == "1":
-            from vector_os_nano.hardware.ros2.runtime import get_ros2_runtime
-            get_ros2_runtime().add_node(self._node)
+        if use_shared_runtime:
+            assert shared_runtime is not None
+            shared_runtime.add_node(self._node)
             self._shared_runtime_used = True
         else:
             # Legacy per-proxy spin (rollback: VECTOR_SHARED_EXECUTOR=0)
@@ -244,12 +247,15 @@ class PiperROS2Proxy:
         )
 
     def disconnect(self) -> None:
-        """Destroy the ROS2 node. Does not shut down rclpy (shared)."""
+        """Destroy the ROS2 node and release an idle runtime-owned context."""
         self._connected = False
         if self._shared_runtime_used and self._node is not None:
             try:
                 from vector_os_nano.hardware.ros2.runtime import get_ros2_runtime
-                get_ros2_runtime().remove_node(self._node)
+
+                runtime = get_ros2_runtime()
+                runtime.remove_node(self._node)
+                runtime.shutdown_if_idle()
             except Exception:
                 pass  # best effort — don't block teardown
         self._shared_runtime_used = False
@@ -374,19 +380,12 @@ class PiperROS2Proxy:
     def _sync_ik_base(self, arm_joints: list[float] | None) -> None:
         """Write dog world pose (from base_proxy) into the IK data.
 
-        The base proxy's ``get_position()`` returns the *sensor* frame
-        position published on /state_estimation (body + _SENSOR_X forward,
-        _SENSOR_Z up).  The MJCF free-body qpos[0:3] represents the *body*
-        origin, so we must subtract the sensor offset before writing.
+        ``BaseProtocol.get_position()`` returns the robot body centre.  The
+        Go2 ROS proxy owns the one sensor-to-body conversion at its odometry
+        boundary, so IK must not subtract the lidar mounting offset again.
         """
-        sx, sy, sz = self._base.get_position()
+        x, y, z = self._base.get_position()
         yaw = float(self._base.get_heading())
-        # Sensor → body: reverse the bridge's rotation + offset
-        cos_h = math.cos(yaw)
-        sin_h = math.sin(yaw)
-        x = sx - cos_h * _BODY_SENSOR_DX
-        y = sy - sin_h * _BODY_SENSOR_DX
-        z = sz - _BODY_SENSOR_DZ
         qw, qx, qy, qz = _yaw_to_quat_wxyz(yaw)
 
         self._ik_data.qpos[0] = float(x)
@@ -574,7 +573,14 @@ class PiperGripperROS2Proxy:
         from sensor_msgs.msg import JointState
         from std_msgs.msg import Float64, Float64MultiArray
 
-        if not rclpy.ok():
+        use_shared_runtime = os.environ.get("VECTOR_SHARED_EXECUTOR", "1") == "1"
+        shared_runtime: Any | None = None
+        if use_shared_runtime:
+            from vector_os_nano.hardware.ros2.runtime import get_ros2_runtime
+
+            shared_runtime = get_ros2_runtime()
+            shared_runtime.ensure_initialized()
+        elif not rclpy.ok():
             rclpy.init()
         self._node = Node(self._node_name)
         self._cmd_pub = self._node.create_publisher(Float64, "/piper/gripper_cmd", 10)
@@ -607,10 +613,9 @@ class PiperGripperROS2Proxy:
         )
 
         # Route to shared executor or legacy per-proxy spin.
-        import os as _os
-        if _os.environ.get("VECTOR_SHARED_EXECUTOR", "1") == "1":
-            from vector_os_nano.hardware.ros2.runtime import get_ros2_runtime
-            get_ros2_runtime().add_node(self._node)
+        if use_shared_runtime:
+            assert shared_runtime is not None
+            shared_runtime.add_node(self._node)
             self._shared_runtime_used = True
         else:
             # Legacy per-proxy spin (rollback: VECTOR_SHARED_EXECUTOR=0)
@@ -628,7 +633,10 @@ class PiperGripperROS2Proxy:
         if self._shared_runtime_used and self._node is not None:
             try:
                 from vector_os_nano.hardware.ros2.runtime import get_ros2_runtime
-                get_ros2_runtime().remove_node(self._node)
+
+                runtime = get_ros2_runtime()
+                runtime.remove_node(self._node)
+                runtime.shutdown_if_idle()
             except Exception:
                 pass  # best effort — don't block teardown
         self._shared_runtime_used = False

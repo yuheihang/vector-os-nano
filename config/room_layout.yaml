@@ -1,27 +1,117 @@
-# Room layout for go2_room.xml simulation environment.
-# Loaded into SceneGraph on sim startup for instant position-based room detection.
+# Deterministic layout prior for the bundled 20 m x 14 m Go2 house.
 #
-# SIM ONLY — for real-world deployment, replace this with SLAM-based
-# spatial understanding (VLM room identification, semantic mapping, etc.)
-#
-# Format: room_name: [center_x, center_y]
-# Coordinates match go2_room.xml (20m x 14m house).
+# Schema v2 is an executable *topology prior*: room polygons define membership,
+# and every door defines the physical opening plus a safe point on each side.
+# FAR/localPlanner still owns geometric obstacle avoidance between consecutive
+# points; this file does not replace an occupancy map or dynamic sensing.
+schema_version: 2
+
+robot:
+  # Go2 body/arm envelope used only to reject doors that are known too narrow.
+  footprint_width_m: 0.55
+  door_clearance_m: 0.15
 
 rooms:
-  living_room:    [3.0,  2.5]
-  dining_room:    [3.0,  7.5]
-  kitchen:        [17.0, 2.5]
-  study:          [17.0, 7.5]
-  master_bedroom: [3.5,  12.0]
-  guest_bedroom:  [16.0, 12.0]
-  bathroom:       [9.5,  12.0]
-  hallway:        [10.0, 5.0]
+  living_room:
+    center: [3.0, 2.5]
+    polygon: [[0.0, 0.0], [6.0, 0.0], [6.0, 5.0], [0.0, 5.0]]
+    aliases: [living room, living, lounge, 客厅, 大厅]
+  dining_room:
+    center: [3.0, 7.5]
+    # The semantic centre is occupied by the dining-table collision box.
+    # This free-space destination is reachable from both dining-room doors.
+    navigation_goal: [4.8, 6.0]
+    polygon: [[0.0, 5.0], [6.0, 5.0], [6.0, 10.0], [0.0, 10.0]]
+    aliases: [dining room, dining, 餐厅, 饭厅]
+  kitchen:
+    center: [17.0, 2.5]
+    # The semantic centre overlaps the kitchen island.
+    navigation_goal: [15.0, 3.5]
+    polygon: [[14.0, 0.0], [20.0, 0.0], [20.0, 5.0], [14.0, 5.0]]
+    aliases: [kitchen, 厨房]
+  study:
+    center: [17.0, 7.5]
+    polygon: [[14.0, 5.0], [20.0, 5.0], [20.0, 10.0], [14.0, 10.0]]
+    aliases: [study, office, 书房, 办公室]
+  master_bedroom:
+    center: [3.5, 12.0]
+    polygon: [[0.0, 10.0], [7.0, 10.0], [7.0, 14.0], [0.0, 14.0]]
+    aliases: [master bedroom, master, 主卧, 主卧室]
+  guest_bedroom:
+    center: [16.0, 12.0]
+    # The semantic centre is too close to guest_nightstand; with the FAR
+    # body-to-sensor goal projection it can put the planner goal inside the
+    # collision box.  Keep the room label at the semantic centre and navigate
+    # to this open patch instead.
+    navigation_goal: [15.0, 12.0]
+    polygon: [[12.0, 10.0], [20.0, 10.0], [20.0, 14.0], [12.0, 14.0]]
+    aliases: [guest bedroom, guest room, guest, 客卧, 客房, 次卧]
+  bathroom:
+    center: [9.5, 12.0]
+    polygon: [[7.0, 10.0], [12.0, 10.0], [12.0, 14.0], [7.0, 14.0]]
+    aliases: [bathroom, bath, restroom, toilet, 卫生间, 浴室, 洗手间]
+  hallway:
+    center: [10.0, 5.0]
+    polygon: [[6.0, 0.0], [14.0, 0.0], [14.0, 10.0], [6.0, 10.0]]
+    aliases: [hallway, hall, corridor, 走廊, 过道]
 
 doors:
-  living_room-hallway:    [6.5,  3.0]
-  dining_room-hallway:    [6.5,  8.0]
-  kitchen-hallway:        [13.5, 3.0]
-  study-hallway:          [13.5, 8.0]
-  master_bedroom-hallway: [3.0,  10.5]
-  guest_bedroom-hallway:  [16.0, 10.0]
-  bathroom-hallway:       [8.5,  10.0]
+  # Physical opening in the y=5 wall (MJCF iw_ld1/iw_ld2).
+  living_room-dining_room:
+    center: [3.0, 5.0]
+    width: 1.2
+    normal: [0.0, 1.0]
+    room_a_standoff: [3.0, 4.4]
+    room_b_standoff: [3.0, 5.6]
+  living_room-hallway:
+    center: [6.0, 3.0]
+    width: 1.2
+    normal: [1.0, 0.0]
+    room_a_standoff: [5.4, 3.0]
+    room_b_standoff: [6.6, 3.0]
+  dining_room-hallway:
+    center: [6.0, 8.0]
+    width: 1.2
+    normal: [1.0, 0.0]
+    room_a_standoff: [5.4, 8.0]
+    room_b_standoff: [6.6, 8.0]
+  kitchen-hallway:
+    center: [14.0, 3.0]
+    width: 1.2
+    normal: [-1.0, 0.0]
+    room_a_standoff: [14.6, 3.0]
+    room_b_standoff: [13.4, 3.0]
+  study-hallway:
+    center: [14.0, 8.0]
+    width: 1.2
+    normal: [-1.0, 0.0]
+    room_a_standoff: [14.6, 8.0]
+    room_b_standoff: [13.4, 8.0]
+  # Physical opening in the y=5 wall (MJCF iw_ks1/iw_ks2).
+  kitchen-study:
+    center: [17.0, 5.0]
+    width: 1.2
+    normal: [0.0, 1.0]
+    room_a_standoff: [17.0, 4.4]
+    room_b_standoff: [17.0, 5.6]
+  # The y=10 opening at x=3 connects the master bedroom to the dining room;
+  # treating it as a hallway edge would create a topologically impossible hop.
+  master_bedroom-dining_room:
+    center: [3.0, 10.0]
+    width: 1.2
+    normal: [0.0, -1.0]
+    room_a_standoff: [3.0, 10.6]
+    room_b_standoff: [3.0, 9.4]
+  # Likewise, the guest-bedroom opening is physically above the study.
+  guest_bedroom-study:
+    center: [16.0, 10.0]
+    width: 1.2
+    normal: [0.0, -1.0]
+    room_a_standoff: [16.0, 10.6]
+    room_b_standoff: [16.0, 9.4]
+  bathroom-hallway:
+    center: [8.5, 10.0]
+    width: 1.2
+    normal: [0.0, -1.0]
+    room_a_standoff: [8.5, 10.6]
+    room_b_standoff: [8.5, 9.4]

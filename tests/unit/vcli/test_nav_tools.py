@@ -99,6 +99,18 @@ class TestNavStateTool:
     def test_nav_tool_is_concurrency_safe(self, nav_tool):
         assert nav_tool.is_concurrency_safe({}) is True
 
+    def test_nav_state_reads_active_file_override_at_execute_time(
+        self, nav_tool, tmp_path, monkeypatch
+    ):
+        active_file = tmp_path / "session" / "nav_active"
+        active_file.parent.mkdir()
+        active_file.write_text("1", encoding="utf-8")
+        monkeypatch.setenv("VECTOR_NAV_ACTIVE_FILE", str(active_file))
+
+        result = nav_tool.execute({}, _make_context())
+
+        assert json.loads(result.content)["nav_flag_active"] is True
+
 
 # ---------------------------------------------------------------------------
 # TerrainStatusTool tests
@@ -107,15 +119,15 @@ class TestNavStateTool:
 
 class TestTerrainStatusTool:
 
-    def test_terrain_status_file_exists(self, terrain_tool, tmp_path):
+    def test_terrain_status_file_exists(self, terrain_tool, tmp_path, monkeypatch):
         """When terrain file exists, file_exists=True and size is reported."""
         npz_file = tmp_path / "terrain_map.npz"
         ix = np.array([1, 2, 3])
         np.savez(str(npz_file), ix=ix)
 
         ctx = _make_context()
-        with patch("vector_os_nano.vcli.tools.nav_tools._TERRAIN_PATH", str(npz_file)):
-            result = terrain_tool.execute({}, ctx)
+        monkeypatch.setenv("VECTOR_TERRAIN_MAP_FILE", str(npz_file))
+        result = terrain_tool.execute({}, ctx)
 
         assert not result.is_error
         data = json.loads(result.content)
@@ -123,12 +135,12 @@ class TestTerrainStatusTool:
         assert data["file_size_kb"] > 0
         assert data["voxel_count"] == 3
 
-    def test_terrain_status_file_missing(self, terrain_tool, tmp_path):
+    def test_terrain_status_file_missing(self, terrain_tool, tmp_path, monkeypatch):
         """When terrain file is absent, file_exists=False with graceful output."""
         missing = tmp_path / "no_terrain_here.npz"
         ctx = _make_context()
-        with patch("vector_os_nano.vcli.tools.nav_tools._TERRAIN_PATH", str(missing)):
-            result = terrain_tool.execute({}, ctx)
+        monkeypatch.setenv("VECTOR_TERRAIN_MAP_FILE", str(missing))
+        result = terrain_tool.execute({}, ctx)
 
         assert not result.is_error
         data = json.loads(result.content)
@@ -136,18 +148,23 @@ class TestTerrainStatusTool:
         assert data["file_size_kb"] == 0
         assert data["voxel_count"] == 0
 
-    def test_terrain_status_fields(self, terrain_tool, tmp_path):
+    def test_terrain_status_fields(self, terrain_tool, tmp_path, monkeypatch):
         """All expected fields must be present in the output."""
         npz_file = tmp_path / "terrain_map.npz"
         np.savez(str(npz_file), ix=np.array([10, 20]))
 
         ctx = _make_context()
-        with patch("vector_os_nano.vcli.tools.nav_tools._TERRAIN_PATH", str(npz_file)):
-            result = terrain_tool.execute({}, ctx)
+        replay_file = tmp_path / "nav_replay"
+        replay_file.write_text("1", encoding="utf-8")
+        monkeypatch.setenv("VECTOR_TERRAIN_MAP_FILE", str(npz_file))
+        monkeypatch.setenv("VECTOR_NAV_REPLAY_FILE", str(replay_file))
+        result = terrain_tool.execute({}, ctx)
 
         data = json.loads(result.content)
         for key in ("file_exists", "file_path", "file_size_kb", "replay_triggered", "voxel_count"):
             assert key in data, f"Missing field: {key}"
+        assert data["file_path"] == str(npz_file)
+        assert data["replay_triggered"] is True
 
     def test_terrain_tool_is_read_only(self, terrain_tool):
         assert terrain_tool.is_read_only({}) is True

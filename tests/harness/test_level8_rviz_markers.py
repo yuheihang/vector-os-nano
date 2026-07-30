@@ -24,8 +24,8 @@ Marker namespaces under test
     robot           -- ARROW at current robot position (teal)
     robot_body      -- CYLINDER showing robot footprint
     trajectory      -- LINE_STRIP path history
-    nav_goal        -- CYLINDER beacon at navigation target (only when provided)
-    nav_goal_label  -- TEXT_VIEW_FACING "GOAL" label above the cylinder
+    nav_goal        -- SPHERE at navigation target (only when provided)
+    nav_goal_label  -- TEXT_VIEW_FACING "GOAL" label above the sphere
 
 Reference: ``vector_os_nano/ros2/nodes/scene_graph_viz.py``
 """
@@ -377,7 +377,7 @@ class TestLevel8RVizMarkers:
         assert len(goal_markers) == 0
 
     def test_nav_goal_marker(self):
-        """Navigation goal is shown as a CYLINDER beacon in 'nav_goal' namespace."""
+        """Navigation goal is shown as a red SPHERE in 'nav_goal' namespace."""
         from visualization_msgs.msg import Marker
 
         sg = self._fresh_sg()
@@ -386,18 +386,18 @@ class TestLevel8RVizMarkers:
         goal_markers = [m for m in ma.markers if m.ns == "nav_goal"]
         assert len(goal_markers) >= 1
 
-        # Find the tall beacon cylinder (scale.z > 1.0)
-        beacon = next(
-            (m for m in goal_markers if m.scale.z > 1.0), None
+        goal = next(
+            (m for m in goal_markers if m.type == Marker.SPHERE), None
         )
-        assert beacon is not None, "Expected a tall CYLINDER beacon for nav_goal"
-        assert beacon.type == Marker.CYLINDER
-        assert beacon.pose.position.x == pytest.approx(12.0)
-        assert beacon.pose.position.y == pytest.approx(7.5)
-        # Red beacon
-        assert beacon.color.r == pytest.approx(1.0, abs=0.05)
-        assert beacon.color.g < 0.3
-        assert beacon.color.b < 0.3
+        assert goal is not None, "Expected a SPHERE marker for nav_goal"
+        assert goal.pose.position.x == pytest.approx(12.0)
+        assert goal.pose.position.y == pytest.approx(7.5)
+        assert goal.scale.x == pytest.approx(goal.scale.y)
+        assert goal.scale.y == pytest.approx(goal.scale.z)
+        # Red goal
+        assert goal.color.r == pytest.approx(1.0, abs=0.05)
+        assert goal.color.g < 0.3
+        assert goal.color.b < 0.3
 
     def test_nav_goal_label_appears(self):
         """A 'GOAL' text label appears in 'nav_goal_label' namespace when goal is set."""
@@ -605,7 +605,7 @@ class TestLevel8RVizMarkers:
         assert len(ma_with_traj.markers) == base_count + 1
 
     def test_marker_count_grows_with_nav_goal(self):
-        """Adding nav_goal increases marker count (cylinder + disc + label = +3)."""
+        """Adding nav_goal increases marker count (sphere + disc + label = +3)."""
         sg = self._fresh_sg()
         ma_no_goal = self._make_markers(sg)
         base_count = len(ma_no_goal.markers)

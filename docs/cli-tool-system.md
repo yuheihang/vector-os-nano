@@ -32,7 +32,7 @@ AI Agent (VectorEngine)
 │  用户输入 ──→ IntentRouter (意图分类)                             │
 │                  │                                              │
 │                  ↓                                              │
-│              VectorEngine.run_turn()                             │
+│              VectorEngine.run_turn_native() / run_turn()          │
 │                  │                                              │
 │                  ├── DynamicSystemPrompt                         │
 │                  │     ├── 角色设定 (缓存)                        │
@@ -59,6 +59,11 @@ AI Agent (VectorEngine)
 │                  └── Session (JSONL 持久化)                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+裸 `vector-cli` 的自然语言 REPL 默认使用 `run_turn_native()`；`run_turn()` 是兼容路径。
+二者复用同一个 VectorEngine、world 注册表和验证命名空间。下述分类路由流程主要描述
+通用/兼容 tool-use 路径；native producer 则直接组合当前 world 的 action surface 与合成的
+`verify`、`finish` 工具。
 
 ## Tool Call 完整流程
 
@@ -220,6 +225,134 @@ Robot skill（`@skill` 装饰器）自动包装为 LLM tool：
 | no_vlm | VLM 不可用，检查 Ollama 是否运行 |
 | camera_failed | 摄像头未连接，用 robot_status 检查硬件 |
 
+## Native CLI 导航契约（P1）
+
+有移动底座时，native producer 只向模型暴露两个无歧义的导航 schema：
+
+| native 工具 | 使用条件 | 独立验收 |
+|---|---|---|
+| `navigate_room(room: str)` | 用户给出命名房间，如 `dining room`、`厨房` | `in_room("canonical_room")` |
+| `navigate_xy(x: float, y: float)` | 用户明确给出坐标，或上游感知/规划工具返回坐标 | `at_position(x, y)` |
+
+`navigate` 仍是内部正式 `NavigateSkill` 的名称，不再作为模糊的 native 公共 schema。
+两个 native 适配器都委托该正式技能执行；其中命名分支统一通过
+`navigation/room_resolver.py::RoomResolver` 规范化中英文别名、检查可用房间并读取中心。
+native 层不保存第二份坐标表，也不直接绕过技能调用 base。命名解析失败返回
+`unknown_room` 和当前可用房间，保持停车，不得再调用 `navigate_xy` 猜一个坐标。
+
+房间词表和执行解析来自同一个 live SceneGraph：
+
+- `known_layout`：可见已装载到 SceneGraph 的全部先验房间节点。
+- `unknown_exploration`：只可见在线发现的房间；不得读取未发现房间的布局中心。
+
+native prompt 每轮列出这组 canonical room IDs，并明确要求：命名目的地调用
+`navigate_room`，绝不发明房间坐标；只有显式坐标或上游工具给出的坐标才调用
+`navigate_xy`。原始 `room_layout.yaml` 不直接交给模型。
+
+坐标导航的 transport 到达半径与 `at_position` 验证统一为 0.5 m，不能再出现底层已
+返回成功、验证层却永久失败的死区。停滞检测按一段时间窗口内的累计进展判断：接近
+目标、机体实际平移或实际转动都算进展，允许大角度对齐和 localPlanner 为绕障先横移/
+短暂远离目标。这里的低速可能来自转向、曲率、障碍或接近目标，是通用观测条件，不是
+门区固定限速；连续三次相同导航/验证失败后 native runner 停止恢复并报告失败。交互
+trace 会把连续同目标的重复尝试压缩为一行并标出 attempts，完整尝试细节仍保留在诊断
+日志中。
+
+在 `known_layout` 仿真中，schema-v2 配置中的房间 polygon 与门的中心、宽度、法向和
+两侧 standoff 是确定性拓扑先验：启动时会覆盖旧持久化文件中漂移的先验几何值，但
+保留已学习的物体、房间描述、访问历史以及门观测记录。在线 observed 门不会成为
+已知户型的捷径。命名导航先生成可信门链，再逐段提交
+`door_pre → door_center → door_post → … → room_goal`；任何一段无路、超时或落点超差
+都会停车，且不得跳过该门直达目标。房间 `center` 保留语义含义；若中心被家具占用，
+执行层使用同一房间 polygon 内的 `navigation_goal`。例如 dining room 的语义中心是
+`(3.0, 7.5)`，实际安全落点是 `(4.8, 6.0)`。
+到 `door_pre` 的房间内接近段允许控制器正常对齐；只有
+`door_pre → door_center → door_post` 的实际门槛穿越禁止倒车，并执行严格门点/segment
+ACK。所有门点均为 `speed_limit_mps=null`，不施加额外固定低速上限；localPlanner
+使用与普通导航相同的正常自适应速度。障碍、曲率、转向以及接近每个 waypoint 时的
+通用减速仍然有效。
+`unknown_exploration` 使用独立持久化文件，不加载这些先验。
+
+### P2 运行时导航与可视化契约
+
+已知户型不是 7 门的“所有房间经 hallway”模型，而是与 MJCF 一致的 8 房间、9 门
+拓扑。除 hallway 两侧门外，还包括 living room ↔ dining room
+`(3.0, 5.0)`、kitchen ↔ study `(17.0, 5.0)` 两扇直连门；y=10 的三个开口分别是
+master bedroom ↔ dining room、guest bedroom ↔ study、bathroom ↔ hallway。因而
+living room ↔ dining room 必须使用直连门，fresh hallway → dining room 则只使用
+hallway ↔ dining room 门。旧 7 门先验会制造用户在 RViz 中看到的错误远路。
+
+一条门链以 `room_route_timeout=360 s` 作为最小总墙钟预算，并按拓扑复杂度和机体
+折线路程有界扩展：`min(1200, max(360, door_count×300, polyline_m×55))`。执行器再按
+当前位置到剩余 waypoint 的折线距离分配各段时间，同时为每个后续段保留
+`room_route_min_segment_timeout=35 s`。因此三扇门、十个分段不会再让未来段的保底时间
+耗尽当前段预算；绝对上限仍为 1200 s。真正无进展由 30 s stall watchdog 提前
+fail closed 并停车，门点容差不会因预算扩展而放宽。
+
+应用层坐标统一是 `map` 中的 Go2 机体中心：房间点、显式 XY、`get_position()` 与
+deterministic verify 都遵守这个定义。CMU 栈的 `/state_estimation` 则发布
+`child_frame_id=sensor`，传感器相对机体前置 0.30 m、上置 0.20 m；proxy 在读取时只做
+一次 sensor → body 转换，并把机体目标投影成 FAR 所需的传感器目标。FAR 终止点同样用
+body → sensor 转换。localPlanner `/path` 的 `map` 坐标直接使用，`sensor` 坐标以传感器
+为原点，`vehicle/base_link` 以机体为原点；不认识的 frame 会被拒绝并清空，避免悄悄
+错 0.30 m 或把局部路径当全局路径。
+
+RViz 产品层只默认显示四条有明确来源的 Path：
+
+| Topic | 含义/颜色 | 生命周期 |
+|---|---|---|
+| `/scene_graph/door_path` | 门级拓扑，紫 | `RELIABLE + TRANSIENT_LOCAL + KEEP_LAST(1)` |
+| `/far/global_path` | FAR 全局路径，蓝 | 同上 |
+| `/local_planner/path` | localPlanner 局部路径，绿 | 同上 |
+| `/nav/executed_path` | 机体实际轨迹，黄 | 同上 |
+
+四路 publisher 在启动时保留空 Path，新目标开始前先清旧状态，并在成功、失败、取消、
+reset、nav gate 关闭或断开时再次保留空 Path；晚启动的 RViz 因而收到的是空终态，不会
+复活上次路线。第三方原始 `/path`、`/viz_path_topic`、`/exploration_path` 和
+`/global_path_full` 在默认 RViz 配置中关闭。
+
+动态验收中，“非空 `/registered_scan` + 非空 `/local_planner/path` + 最终到达”证明
+传感器障碍数据和 localPlanner 确实参与本次导航，不是只画了一条 SceneGraph 直线。
+这仍不是受控移动障碍避让试验；要验证后者还需布置可复现障碍并记录安全间距与绕行
+轨迹。
+
+导航结果使用统一 envelope，便于 trace、日志和后续验证关联：
+
+```json
+{
+  "goal_id": "G123",
+  "goal_type": "room",
+  "requested_room": "dining room",
+  "canonical_room": "dining_room",
+  "target_xy": [4.8, 6.0],
+  "semantic_center_xy": [3.0, 7.5],
+  "source": "scene_graph",
+  "planner": "far_segmented",
+  "arrived": true,
+  "verification_mode": "polygon",
+  "navigation_stats": {
+    "nonzero_cmd_count": 417,
+    "cmd_vel_count": 417,
+    "nonzero_cmd_duration_s": 21.3,
+    "moved_distance_m": 5.8,
+    "distance_travelled_m": 5.8,
+    "actual_velocity_observed": true,
+    "actor_caused": true
+  }
+}
+```
+
+`in_room(room_id)` 与导航共用 `RoomResolver`。它按 `room_at`、polygon、bounds 的顺序
+判断房间归属；几何信息不足时才降级到最近中心，并把
+`verification_mode=nearest_center` 留在可观察结果中。未知房间、无底座或不可用几何都
+fail closed。
+
+actor causation 也以 `goal_id` 为边界：proxy/bridge 必须记录属于该目标的实际非零
+path-following `cmd_vel`，并结合底座位移，才能把动作评为 CAUSED。仅发布目标、零速度、
+后台自然漂移或其他目标的速度都不能归因给当前动作。真实移动但未通过 `in_room` /
+`at_position` 只能是 RAN；动作证据和确定性 post-condition 都通过后才是 GROUNDED。
+`navigation_stats.actor_caused` 同样要求实际命令和超过抖动阈值的位移；仅观察到非零
+命令时只设置 `actual_velocity_observed=true`。
+
 ## 复杂 NL 任务的分解路径 — cognitive/ VGG 层
 
 单工具调用（"pick the cup"）由 VectorEngine 的 agent 循环直接处理。**多步复杂任务**的自然语言分解由 `vcli/cognitive/` 负责：
@@ -312,10 +445,13 @@ LLM 每次对话都看到：
 [Robot State]
 Position: (10.2, 5.3, 0.28) — hallway
 Heading: 23 deg (NNE)
-SceneGraph: 8 rooms (6 visited), 7 doors, 12 objects
+SceneGraph: 8 rooms (6 visited), 9 doors, 12 objects
 Exploring: no
 Nav stack: running
 ```
+
+native CLI 另外从 live SceneGraph/`RoomResolver` 重建 `Known rooms: ...`，并携带当前
+`known_layout` / `unknown_exploration` 模式；它不从原始 YAML 复制房间坐标。
 
 ## RobotContextProvider — 机器人状态采集
 
@@ -344,7 +480,7 @@ Nav stack: running
 6. `tool.check_permissions()` 返回 ask → 提示用户确认
 7. 默认 → 提示用户确认
 
-电机技能（navigate、walk、pick）→ 始终 ask。
+电机技能（`navigate_room`、`navigate_xy`、walk、pick）→ 始终 ask。
 只读工具（file_read、grep、ros2_topics）→ 始终 allow。
 
 ## 完整工具清单 (19 内置 + 臂控技能)
@@ -379,13 +515,73 @@ Nav stack: running
 
 home, wave, scan, detect, describe, pick, place, gripper_open, gripper_close, handover
 
+## CLI 日志分流
+
+交互终端只显示关键进度、压缩后的 action/verdict 和可操作错误，不直接承载网络库、
+OpenGL 或 asyncio 的 DEBUG 流。Vector 自身诊断写入私有轮转文件
+`~/.vector/logs/vector-cli.log`（默认 INFO，`--verbose` 时 DEBUG，5 MiB × 3 个备份）；
+可用 `VECTOR_CLI_LOG_FILE` 覆盖路径。默认受管目录或 CLI 新建的目录使用 0700；当前
+日志和轮转代文件始终使用 0600。已有的自定义父目录权限不会被 CLI 擅自修改。第三方
+HTTP/SDK wire DEBUG 在 verbose 模式也保持抑制，避免完整 prompt、请求头和代理细节
+进入终端或诊断文件。
+
+每次手工动态验收建议创建新的时间戳目录；不要重复使用 `run_01` 覆盖上一轮：
+
+```zsh
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+CASE="$PWD/artifacts/benchmarks/afterp2/nav/manual_${RUN_ID}"
+install -d -m 700 "$CASE" "$CASE/ros"
+git rev-parse HEAD > "$CASE/git-head.txt"
+git status --short > "$CASE/git-status.txt"
+
+( umask 077
+  VECTOR_CLI_LOG_FILE="$CASE/vector-cli.log" \
+  VECTOR_VNAV_LOG_FILE="$CASE/sim.log" \
+  ROS_LOG_DIR="$CASE/ros" \
+  script -q -f -e -c "vector-cli" "$CASE/cli.typescript"
+)
+```
+
+进入 CLI 后按正常产品流程启动仿真并逐条发导航命令，结束时输入 `/exit` 或按
+`Ctrl-D`。`cli.typescript` 是用户实际看到的 PTY 转录（会保留 ANSI 控制字符），
+`vector-cli.log` 是 Vector 诊断日志，`ros/` 是 ROS 日志，`sim.log` 是本轮
+bridge/FAR/localPlanner/TARE/RViz 联合日志。用户提供问题复现时，至少同时提交
+`cli.typescript`、`vector-cli.log`、`sim.log`、`git-head.txt` 和 RViz 截图；仅有终端
+截图通常无法区分拓扑、FAR、localPlanner 与显示残留。
+
+如需跑不经过 LLM 的 P2 产品级验收，应先退出上述手工仿真，避免两套栈争用锁和 ROS
+topic，然后执行：
+
+```zsh
+python scripts/verify_p2_room_navigation.py --plan-only
+python scripts/verify_p2_room_navigation.py
+python scripts/verify_p2_room_navigation.py --targets kitchen study guest_bedroom
+python scripts/verify_p2_room_navigation.py --all-rooms
+```
+
+第二条默认生成时间戳目录 `artifacts/benchmarks/afterp2/nav/dynamic_*`，其中
+`report.json` 记录三段真实房间导航、启动/晚加入空 Path、四路路径、registered scan、
+localPlanner 参与和终态清理证据，`sim.log` 保留对应运行日志。2026-07-29 的最终
+带 Piper 验收证据为 `dynamic_codex_20260729_14`，三段均成功，反向段还覆盖了
+localPlanner 先横移再进直连门的有效局部轨迹；这项证据证明
+localPlanner 在真实链路中参与，不等同于受控移动障碍专项认证。`--targets` 可按顺序
+验收任意房间/别名并核对多门链；`--all-rooms` 使用最短的相邻腿序列覆盖 8 个房间和
+9 扇门。每腿完成后会写入 `progress.json`，长验收即使中断也能保留已完成 case。
+2026-07-30 的其余房间证据位于
+`dynamic_other_rooms_codex_20260730_03_master`、
+`dynamic_other_rooms_codex_20260730_04_kitchen_study_guest` 和
+`dynamic_other_rooms_codex_20260730_05_bathroom`，五个此前未测试的目标房间均成功；
+`dynamic_other_rooms_codex_20260730_06_remaining_doors` 又补齐
+`study-hallway` 与 `living_room-hallway`。聚合证据动态覆盖 8/8 房间和 9/9 物理门。
+
 ## Session 持久化
 
 JSONL 格式，原子写入 + fsync：
 ```
 {"type":"user","content":"去厨房","ts":"..."}
-{"type":"assistant","text":"","tool_use":[{"name":"navigate","input":{"room":"kitchen"}}],"ts":"..."}
-{"type":"tool_result","results":[{"content":"Skill 'navigate' succeeded..."}],"ts":"..."}
+{"type":"assistant","text":"","tool_use":[{"name":"navigate_room","input":{"room":"厨房"}}],"ts":"..."}
+{"type":"tool_result","results":[{"content":"NavigateSkill succeeded: canonical_room=kitchen..."}],"ts":"..."}
+{"type":"assistant","text":"","tool_use":[{"name":"verify","input":{"expr":"in_room('kitchen')"}}],"ts":"..."}
 {"type":"assistant","text":"到了厨房，你要我看看有什么吗？","ts":"..."}
 ```
 

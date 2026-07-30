@@ -73,6 +73,10 @@ class TestSceneGraphQueryToolProtocol:
         assert "query_type" in tool.input_schema["properties"]
         assert "query_type" in tool.input_schema["required"]
 
+    def test_input_schema_exposes_safe_route(self, tool):
+        query_types = tool.input_schema["properties"]["query_type"]["enum"]
+        assert "safe_route" in query_types
+
 
 class TestQueryRooms:
     def test_query_rooms_returns_list(self, tool):
@@ -122,6 +126,33 @@ class TestQueryDoors:
         assert rooms == {"kitchen", "hallway"}
         assert door["x"] == pytest.approx(13.5)
         assert door["y"] == pytest.approx(3.0)
+
+    def test_query_doors_exposes_source_and_execution_geometry(self, tool):
+        sg = _make_test_sg()
+        sg.add_door(
+            "kitchen",
+            "hallway",
+            13.5,
+            3.0,
+            door_id="kitchen-hallway",
+            width=1.2,
+            normal=(-1.0, 0.0),
+            room_a_standoff=(14.1, 3.0),
+            room_b_standoff=(12.9, 3.0),
+            source="layout_prior",
+            confidence=1.0,
+            authoritative=True,
+        )
+        result = tool.execute({"query_type": "doors"}, _make_context(sg))
+        data = json.loads(result.content)
+
+        assert data[0]["door_id"] == "kitchen-hallway"
+        assert data[0]["source"] == "layout_prior"
+        assert data[0]["confidence"] == pytest.approx(1.0)
+        assert data[0]["width"] == pytest.approx(1.2)
+        assert data[0]["normal"] == [-1.0, 0.0]
+        assert data[0]["room_a_standoff"] == [14.1, 3.0]
+        assert data[0]["room_b_standoff"] == [12.9, 3.0]
 
 
 class TestQueryObjects:
@@ -221,6 +252,72 @@ class TestQueryDoorChain:
     def test_query_door_chain_missing_params(self, tool):
         ctx = _make_context(_make_test_sg())
         result = tool.execute({"query_type": "door_chain", "src_room": "kitchen"}, ctx)
+        assert result.is_error
+
+
+class TestQuerySafeRoute:
+    @staticmethod
+    def _make_executable_sg() -> SceneGraph:
+        sg = _make_test_sg()
+        sg.add_door(
+            "kitchen",
+            "hallway",
+            13.5,
+            3.0,
+            door_id="kitchen-hallway",
+            width=1.2,
+            normal=(-1.0, 0.0),
+            room_a_standoff=(14.1, 3.0),
+            room_b_standoff=(12.9, 3.0),
+            source="layout_prior",
+            confidence=1.0,
+            authoritative=True,
+        )
+        return sg
+
+    def test_safe_route_returns_structured_door_waypoints(self, tool):
+        result = tool.execute(
+            {
+                "query_type": "safe_route",
+                "src_room": "kitchen",
+                "dst_room": "hallway",
+            },
+            _make_context(self._make_executable_sg()),
+        )
+        assert not result.is_error
+        data = json.loads(result.content)
+
+        assert data["success"] is True
+        assert data["room_path"] == ["kitchen", "hallway"]
+        assert data["door_ids"] == ["kitchen-hallway"]
+        assert [wp["kind"] for wp in data["waypoints"]] == [
+            "door_pre",
+            "door_center",
+            "door_post",
+            "room_goal",
+        ]
+        for waypoint in data["waypoints"]:
+            assert set(("room_from", "room_to", "xy", "tolerance")) <= waypoint.keys()
+
+    def test_safe_route_reports_invalid_legacy_geometry(self, tool):
+        result = tool.execute(
+            {
+                "query_type": "safe_route",
+                "src_room": "kitchen",
+                "dst_room": "hallway",
+            },
+            _make_context(_make_test_sg()),
+        )
+        assert result.is_error
+        data = json.loads(result.content)
+        assert data["success"] is False
+        assert data["diagnosis_code"] == "invalid_topology"
+
+    def test_safe_route_requires_both_endpoints(self, tool):
+        result = tool.execute(
+            {"query_type": "safe_route", "src_room": "kitchen"},
+            _make_context(self._make_executable_sg()),
+        )
         assert result.is_error
 
 

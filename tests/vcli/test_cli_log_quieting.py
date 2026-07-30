@@ -1,141 +1,206 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2024-2026 Vector Robotics
 
-"""REPL log-spam quieting (FIX-logspam).
+"""Product logging contract for the interactive Vector CLI.
 
-On the live SO-101 arm REPL, a step failure (e.g. "no strategy matched",
-"execution failed") is emitted as a cognitive-layer WARNING AND already rendered
-in the rich step UI ("[FAIL] ..."). With ``basicConfig(level=WARNING)`` those
-duplicate WARNINGs propagate to the root console handler and flood the screen
-(2x per step across retries) — pure noise.
-
-``cli._setup_logging`` quiets the cognitive package logger to ERROR on the
-non-verbose REPL console only. This must:
-  - quiet ``vector_os_nano.vcli.cognitive`` to >= ERROR when NOT --verbose,
-  - leave it un-quieted under --verbose (full DEBUG preserved),
-  - NOT silence ERROR/CRITICAL (only WARNING/INFO/DEBUG are dropped),
-  - scope to the cognitive package only (never the root logger).
-
-The fix lives on the CLI entry path; library code / the test suite never call it.
+Rich owns the terminal presentation. Python/SDK diagnostics go to a private
+rotating file, so enabling ``--verbose`` must never dump HTTP state, prompts, or
+project DEBUG records through a live spinner.
 """
 
 from __future__ import annotations
 
 import logging
+import stat
+from pathlib import Path
 
 import pytest
 
 from vector_os_nano.vcli import cli
 
-COGNITIVE = "vector_os_nano.vcli.cognitive"
 
-# Additional namespaces that FIX 2 extends the quieting to.
-QUIET_NAMESPACES = [
-    "vector_os_nano.vcli.cognitive",
-    "vector_os_nano.skills",
-    "vector_os_nano.perception",
-    "vector_os_nano.hardware",
-]
+_TOUCHED_LOGGERS = (
+    *cli._QUIET_LOGGERS,
+    *cli._TRANSPORT_LOGGERS,
+    "vector_os_nano.vcli.engine",
+)
 
 
 @pytest.fixture(autouse=True)
-def _restore_quiet_logger_levels():
-    """Snapshot/restore all quietable logger levels so tests don't leak state."""
-    saved = {name: logging.getLogger(name).level for name in QUIET_NAMESPACES}
+def _restore_logging_state():
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_root_level = root.level
+    saved_levels = {
+        name: logging.getLogger(name).level for name in _TOUCHED_LOGGERS
+    }
+    saved_active_path = cli._ACTIVE_LOG_PATH
     try:
         yield
     finally:
-        for name, level in saved.items():
+        cli._remove_cli_handlers(root)
+        for handler in saved_handlers:
+            root.addHandler(handler)
+        root.setLevel(saved_root_level)
+        for name, level in saved_levels.items():
             logging.getLogger(name).setLevel(level)
+        cli._ACTIVE_LOG_PATH = saved_active_path
 
 
-def test_non_verbose_quiets_cognitive_logger():
-    """Non-verbose REPL: cognitive-layer WARNINGs are quieted (effective >= ERROR)."""
-    logging.getLogger(COGNITIVE).setLevel(logging.NOTSET)
-
-    cli._setup_logging(verbose=False)
-
-    log = logging.getLogger(COGNITIVE)
-    assert log.getEffectiveLevel() >= logging.ERROR
-    # The noisy levels are dropped, but real errors still surface.
-    assert not log.isEnabledFor(logging.WARNING)
-    assert log.isEnabledFor(logging.ERROR)
-    assert log.isEnabledFor(logging.CRITICAL)
+def _flush_cli_handlers() -> None:
+    for handler in logging.getLogger().handlers:
+        if getattr(handler, "_vector_cli_owned", False):
+            handler.flush()
 
 
-def test_verbose_does_not_quiet_cognitive_logger():
-    """--verbose REPL: the cognitive layer is NOT quieted (no ERROR pin)."""
-    # Simulate a prior non-verbose quieting to prove --verbose restores it.
-    logging.getLogger(COGNITIVE).setLevel(logging.ERROR)
-
-    cli._setup_logging(verbose=True)
-
-    log = logging.getLogger(COGNITIVE)
-    # --verbose must REMOVE any explicit ERROR pin (reset to NOTSET) so the
-    # cognitive logger inherits the (DEBUG) root level instead of swallowing
-    # WARNINGs. We assert on the logger's own level rather than the effective
-    # level, since basicConfig only raises the root level when it installs the
-    # root handler (already present under pytest) — the no-quieting contract is
-    # what matters, not whether this process's root happens to be at DEBUG.
-    assert log.level == logging.NOTSET
-    assert log.getEffectiveLevel() < logging.ERROR
-    assert log.isEnabledFor(logging.WARNING)
+def _read(path: Path) -> str:
+    _flush_cli_handlers()
+    return path.read_text(encoding="utf-8")
 
 
-def test_quieting_is_scoped_to_cognitive_not_root():
-    """The quieting touches ONLY the cognitive package logger, not the root."""
-    root = logging.getLogger()
-    saved_root = root.level
-    logging.getLogger(COGNITIVE).setLevel(logging.NOTSET)
-    try:
-        cli._setup_logging(verbose=False)
-        # Root is not raised to ERROR by the quieting — it stays at the
-        # basicConfig WARNING (or lower if already configured); never >= ERROR
-        # purely as a side effect of quieting the cognitive logger.
-        assert root.level <= logging.WARNING
-        # The explicit override lives on the cognitive logger itself.
-        assert logging.getLogger(COGNITIVE).level == logging.ERROR
-    finally:
-        root.setLevel(saved_root)
+def test_non_verbose_keeps_console_quiet_and_retains_info(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "vector-cli.log"
+    assert cli._setup_logging(verbose=False, log_path=path) == path
+
+    log = logging.getLogger("vector_os_nano.vcli.engine")
+    log.debug("internal-debug")
+    log.info("internal-info")
+    log.warning("internal-warning")
+
+    assert capsys.readouterr().err == ""
+    text = _read(path)
+    assert "internal-debug" not in text
+    assert "internal-info" in text
+    assert "internal-warning" in text
 
 
-def test_sibling_loggers_not_quieted():
-    """A non-cognitive logger (e.g. the engine) is unaffected by the quieting."""
-    engine_log = logging.getLogger("vector_os_nano.vcli.engine")
-    saved = engine_log.level
-    engine_log.setLevel(logging.NOTSET)
-    logging.getLogger(COGNITIVE).setLevel(logging.NOTSET)
-    try:
-        cli._setup_logging(verbose=False)
-        # Engine WARNINGs are NOT collateral-damaged by the cognitive quieting.
-        assert engine_log.isEnabledFor(logging.WARNING)
-    finally:
-        engine_log.setLevel(saved)
+def test_verbose_writes_vector_debug_to_file_not_terminal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "vector-cli.log"
+    cli._setup_logging(verbose=True, log_path=path)
+
+    logging.getLogger("vector_os_nano.vcli.engine").debug("vector-debug-detail")
+
+    assert capsys.readouterr().err == ""
+    assert "vector-debug-detail" in _read(path)
 
 
-def test_all_noisy_namespaces_quieted_non_verbose():
-    """Non-verbose: skills, perception, hardware loggers are also quieted to ERROR."""
-    for name in QUIET_NAMESPACES:
-        logging.getLogger(name).setLevel(logging.NOTSET)
-    cli._setup_logging(verbose=False)
-    for name in QUIET_NAMESPACES:
-        log = logging.getLogger(name)
-        assert log.getEffectiveLevel() >= logging.ERROR, (
-            f"{name} should be quieted to ERROR in non-verbose mode"
-        )
-        assert not log.isEnabledFor(logging.WARNING), (
-            f"{name} should not emit WARNINGs in non-verbose mode"
-        )
+def test_transport_wire_debug_is_suppressed_even_when_verbose(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "vector-cli.log"
+    cli._setup_logging(verbose=True, log_path=path)
+
+    logging.getLogger("anthropic._base_client").debug(
+        "Request options: secret prompt and tool schemas"
+    )
+    logging.getLogger("httpcore.http11").debug("raw response headers")
+    logging.getLogger("OpenGL.platform").info("loaded optional accelerator")
+    logging.getLogger("httpx").warning("request retry warning")
+
+    assert capsys.readouterr().err == ""
+    text = _read(path)
+    assert "secret prompt" not in text
+    assert "raw response headers" not in text
+    assert "optional accelerator" not in text
+    assert "request retry warning" in text
 
 
-def test_all_noisy_namespaces_restored_verbose():
-    """--verbose restores all quieted namespaces to NOTSET."""
-    # Simulate prior non-verbose quieting on all namespaces.
-    for name in QUIET_NAMESPACES:
-        logging.getLogger(name).setLevel(logging.ERROR)
-    cli._setup_logging(verbose=True)
-    for name in QUIET_NAMESPACES:
-        log = logging.getLogger(name)
-        assert log.level == logging.NOTSET, (
-            f"{name} should be NOTSET (not pinned) under --verbose"
-        )
+def test_only_errors_cross_into_interactive_terminal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "vector-cli.log"
+    cli._setup_logging(verbose=True, log_path=path)
+
+    log = logging.getLogger("vector_os_nano.skills.navigate")
+    log.warning("planner retry detail")
+    log.error("navigation process unavailable")
+
+    terminal = capsys.readouterr().err
+    assert "planner retry detail" not in terminal
+    assert "navigation process unavailable" in terminal
+    text = _read(path)
+    assert "planner retry detail" in text
+    assert "navigation process unavailable" in text
+
+
+def test_repeated_setup_is_idempotent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first = tmp_path / "first.log"
+    second = tmp_path / "second.log"
+    cli._setup_logging(verbose=False, log_path=first)
+    cli._setup_logging(verbose=True, log_path=second)
+
+    owned = [
+        handler
+        for handler in logging.getLogger().handlers
+        if getattr(handler, "_vector_cli_owned", False)
+    ]
+    assert len(owned) == 2
+
+    logging.getLogger("vector_os_nano.vcli.engine").info("one-record")
+    assert capsys.readouterr().err == ""
+    assert _read(second).count("one-record") == 1
+
+
+def test_log_directory_and_file_are_private(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "vector-cli.log"
+    cli._setup_logging(verbose=True, log_path=path)
+
+    assert path.exists()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_rollover_keeps_each_log_generation_private(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "vector-cli.log"
+    cli._setup_logging(verbose=True, log_path=path)
+    file_handler = next(
+        handler
+        for handler in logging.getLogger().handlers
+        if isinstance(handler, cli._PrivateRotatingFileHandler)
+    )
+
+    logging.getLogger("vector_os_nano.vcli.engine").info("before-rollover")
+    file_handler.flush()
+    file_handler.doRollover()
+    logging.getLogger("vector_os_nano.vcli.engine").info("after-rollover")
+    file_handler.flush()
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(Path(f"{path}.1").stat().st_mode) == 0o600
+
+
+def test_existing_custom_log_directory_mode_is_preserved(tmp_path: Path) -> None:
+    shared = tmp_path / "existing"
+    shared.mkdir(mode=0o750)
+    shared.chmod(0o750)
+
+    cli._setup_logging(verbose=True, log_path=shared / "vector-cli.log")
+
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o750
+
+
+def test_unwritable_log_target_does_not_block_cli(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A directory cannot be opened as a RotatingFileHandler target.
+    assert cli._setup_logging(verbose=True, log_path=tmp_path) is None
+
+    logging.getLogger("vector_os_nano.vcli.engine").error("still-running")
+    assert "still-running" in capsys.readouterr().err
+
+
+def test_verbose_help_describes_file_diagnostics() -> None:
+    args = cli.parse_args(["--verbose"])
+    assert args.verbose is True
